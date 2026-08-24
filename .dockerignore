@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.git/
+.github/
+.claude/
+docs/
+manual/
+assets/
+coverage/
+*.tsbuildinfo
+*.log
+*.tgz
+.env
+.env.*
+.DS_Store
+Thumbs.db

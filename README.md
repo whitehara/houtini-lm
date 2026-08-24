@@ -74,6 +74,45 @@ claude mcp add houtini-lm -- npx -y @houtini/lm
 
 That's it. If LM Studio's running on `localhost:1234` (the default), Claude can start delegating straight away.
 
+### Run in Docker
+
+Prebuilt images are published to GHCR on every push to `main` and every tagged release. **`:latest` only exists once the first `v*` tag has been pushed** — until then, use the `:main` tag (or a commit-SHA tag):
+
+```bash
+docker run --rm -i \
+  -e HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234 \
+  ghcr.io/whitehara/houtini-lm:main
+```
+
+Register it with Claude Code the same way, swapping `command`/`args` for `docker`:
+
+```json
+{
+  "mcpServers": {
+    "houtini-lm": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234",
+        "-v", "houtini-lm-state:/home/node/.houtini-lm",
+        "ghcr.io/whitehara/houtini-lm:main"
+      ]
+    }
+  }
+}
+```
+
+- Pass any `HOUTINI_LM_*` environment variable with `-e`, same as the npm setup above.
+- `-v houtini-lm-state:/home/node/.houtini-lm` persists the model cache and inference lock across container restarts (skip it and each run starts from a cold cache).
+- **`code_task_files` can only read paths visible inside the container.** Mount the code you want reviewed and point the tool at the mounted path:
+  ```bash
+  docker run --rm -i \
+    -e HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234 \
+    -v /path/to/your/project:/workspace:ro \
+    ghcr.io/whitehara/houtini-lm:main
+  ```
+  Then pass `/workspace/...` paths to `code_task_files`, not the host paths.
+
 ### LLM on a different machine
 
 I've got a GPU box on my local network running Qwen 3 Coder Next in LM Studio. If you've got a similar setup, point the URL at it:

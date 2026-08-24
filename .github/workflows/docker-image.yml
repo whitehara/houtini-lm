@@ -1,0 +1,85 @@
+name: Docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+
+      # PR builds load into the local Docker daemon (never pushed) so the
+      # smoke-test step below can run against them.
+      - name: Build (PR — load for smoke test)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: houtini-lm:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boots the freshly built image against an unreachable dummy backend and
+      # confirms the MCP server itself comes up cleanly — startup model
+      # profiling is expected to fail quietly against a dead endpoint, not
+      # crash the process.
+      - name: Smoke test (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm -d --name smoke-test \
+            -e HOUTINI_LM_ENDPOINT_URL=http://127.0.0.1:9/v1 \
+            houtini-lm:smoke
+          sleep 10
+          docker logs smoke-test 2>&1 | tee smoke.log
+          if ! docker ps --filter name=smoke-test --filter status=running -q | grep -q .; then
+            echo "::error::Container exited before the smoke check completed"
+            docker logs smoke-test 2>&1 || true
+            exit 1
+          fi
+          if ! grep -q "Houtini LM server running" smoke.log; then
+            echo "::error::Expected startup line not found in container logs"
+            exit 1
+          fi
+          docker stop smoke-test
+        timeout-minutes: 1
