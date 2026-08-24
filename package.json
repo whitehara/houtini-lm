@@ -13,6 +13,7 @@
     "test:overflow": "node scripts/test-context-overflow.mjs",
     "test:reasoning": "node scripts/test-reasoning.mjs",
     "test:thinking-mode": "node scripts/test-thinking-mode.mjs",
+    "test:progress": "node scripts/test-progress-notifications.mjs",
     "test:lock": "node scripts/verify-inference-lock.mjs",
     "build": "tsc && node scripts/add-shebang.mjs",
     "dev": "tsc --watch",

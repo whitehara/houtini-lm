@@ -829,6 +829,17 @@ interface SamplingParams {
   presencePenalty?: number;
 }
 
+/**
+ * Shape of the SDK's per-request notification sender (extra.sendNotification),
+ * narrowed to the one notification type houtini-lm actually emits. Declared
+ * locally instead of importing the SDK type so this file's dependency surface
+ * stays untouched — the structural shape is all a caller needs to satisfy it.
+ */
+type ProgressNotifier = (notification: {
+  method: 'notifications/progress';
+  params: { progressToken: string | number; progress: number; message?: string };
+}) => Promise<void>;
+
 interface InferenceOptions {
   temperature?: number;
   maxTokens?: number;
@@ -844,6 +855,15 @@ interface InferenceOptions {
    * thinking-mode.ts for the full precedence.
    */
   forceThinking?: boolean;
+  /**
+   * Request-scoped notification sender, supplied by the MCP request handler
+   * from extra.sendNotification. A future HTTP transport routes notifications
+   * by the originating request's stream, so the module-level server.notification()
+   * has no addressee there. Falls back to the module-level server when omitted
+   * (e.g. any future non-request caller) — over stdio the two are byte-identical,
+   * since StdioServerTransport.send() ignores the routing options entirely.
+   */
+  sendNotification?: ProgressNotifier;
 }
 
 /**
@@ -1137,10 +1157,11 @@ async function chatCompletionStreamingInner(
   // response headers flush — that window used to be silent and would trip
   // the client's 60s default timeout before any SSE chunk reached us.
   let progressSeq = 0;
+  const notify: ProgressNotifier = options.sendNotification ?? ((n) => server.notification(n));
   const sendProgress = (message: string) => {
     if (options.progressToken === undefined) return;
     progressSeq++;
-    server.notification({
+    notify({
       method: 'notifications/progress',
       params: {
         progressToken: options.progressToken,
@@ -2396,13 +2417,14 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name } = request.params;
   // `arguments` is optional in the MCP CallTool schema — a client may omit it
   // entirely for a param-less tool (e.g. `stats` with no filter). Default to an
   // empty object so handlers that destructure args never throw on `undefined`.
   const args = request.params.arguments ?? {};
   const progressToken = request.params._meta?.progressToken;
+  const sendNotification = extra.sendNotification;
 
   try {
     switch (name) {
@@ -2440,6 +2462,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           model: route.modelId,
           responseFormat,
           progressToken,
+          sendNotification,
           sampling: extractSamplingParams(args as Record<string, unknown>),
           forceThinking: force_thinking === true,
         });
@@ -2492,6 +2515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           model: route.modelId,
           responseFormat,
           progressToken,
+          sendNotification,
           sampling: extractSamplingParams(args as Record<string, unknown>),
           forceThinking: force_thinking === true,
         });
@@ -2543,6 +2567,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sendNotification,
           sampling: extractSamplingParams(args as Record<string, unknown>),
           forceThinking: force_thinking === true,
         });
@@ -2682,6 +2707,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sendNotification,
           sampling: extractSamplingParams(args as Record<string, unknown>),
           forceThinking: force_thinking === true,
         });
