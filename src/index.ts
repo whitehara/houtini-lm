@@ -412,7 +412,13 @@ interface StreamingResult {
   content: string;
   /** Raw content before think-block stripping (for quality assessment) */
   rawContent: string;
-  /** Reasoning content streamed via OpenAI vendor extension delta.reasoning_content */
+  /**
+   * Reasoning the model produced, when any. Prefers the separate-channel
+   * reasoning (OpenAI vendor extension delta.reasoning_content / Ollama's
+   * delta.reasoning); falls back to <think>...</think> blocks captured while
+   * stripping them from the content channel, for backends that only emit
+   * reasoning inline (LM Studio, vLLM, local Ollama tags).
+   */
   reasoningContent?: string;
   model: string;
   usage?: {
@@ -1394,15 +1400,22 @@ async function chatCompletionStreamingInner(
   }
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
-  // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Claude doesn't
-  // need the model's internal reasoning. Handle three shapes:
+  // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Stripped from
+  // the visible answer by default — but captured into capturedThinkBlocks so
+  // include_reasoning can surface it on request (see reasoningContent below).
+  // Handle three shapes:
   //   1. Balanced  <think>...</think>  — GLM Flash, Nemotron normal case
   //   2. Orphan opener <think>... (truncated)
   //   3. Orphan closer ...</think>  — Ollama Qwen3 streams reasoning directly
   //      on the content channel and terminates with a bare </think> before the
   //      real answer. Strip everything up to and including the first closer.
-  let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
-  cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag
+  const thinkProfile = await getThinkingSupport(modelId).catch(() => null);
+  const capturedThinkBlocks: string[] = [];
+  let cleanContent = content.replace(/<think>([\s\S]*?)<\/think>\s*/g, (_m, inner: string) => {
+    capturedThinkBlocks.push(inner);
+    return '';
+  });   // closed blocks
+  cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag — body stays in content, not captured
   // Orphaned closing tag: reasoning streamed on the content channel then a bare
   // </think> before the answer (Ollama Qwen3). Strip up to the first closer ONLY
   // for models KNOWN to emit think blocks (per the cached profile). For any other
@@ -1411,9 +1424,11 @@ async function chatCompletionStreamingInner(
   // safer failure than deleting answer text (silent, unrecoverable). The earlier
   // backtick heuristic was lose-lose (leaked reasoning containing code, still
   // deleted answers with an unquoted literal); the profile flag is the right signal.
-  const thinkProfile = await getThinkingSupport(modelId).catch(() => null);
   if (thinkProfile?.emitsThinkBlocks && cleanContent.includes('</think>')) {
-    cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
+    cleanContent = cleanContent.replace(/^([\s\S]*?)<\/think>\s*/, (_m, inner: string) => {
+      capturedThinkBlocks.push(inner);
+      return '';
+    });
   }
   cleanContent = cleanContent.trim();
 
@@ -1440,7 +1455,10 @@ async function chatCompletionStreamingInner(
   return {
     content: cleanContent,
     rawContent: content,
-    reasoningContent: reasoning || undefined,
+    // Separate-channel reasoning (delta.reasoning_content / delta.reasoning) wins
+    // when present; otherwise fall back to captured <think> blocks. Never both —
+    // a model that somehow emits both is treated as if only the channel fired.
+    reasoningContent: reasoning || (capturedThinkBlocks.length > 0 ? capturedThinkBlocks.join('\n\n') : undefined),
     model,
     usage,
     finishReason,
