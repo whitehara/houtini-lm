@@ -67,7 +67,7 @@ jobs:
       - name: Smoke test (PR)
         if: github.event_name == 'pull_request'
         run: |
-          docker run --rm -d --name smoke-test \
+          docker run --rm -di --name smoke-test \
             -e HOUTINI_LM_ENDPOINT_URL=http://127.0.0.1:9/v1 \
             houtini-lm:smoke
           sleep 10
