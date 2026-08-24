@@ -38,6 +38,7 @@ import { acquireInferenceLock } from './inference-lock.js';
 import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
 import { formatReasoningBlock } from './reasoning-block.js';
+import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -444,6 +445,17 @@ interface StreamingResult {
   prefillStall?: boolean;
   /** Error payload received mid-stream from the backend (OpenRouter/vLLM/llama.cpp emit these) */
   streamError?: string;
+  /**
+   * The thinking-suppress/force/leave decision made for this call (see
+   * thinking-mode.ts). Internal-only — formatFooter() does not read this
+   * field, so it has no effect on the response text on the default path.
+   * Left undefined on the OpenRouter branch (reasoningStyle ===
+   * 'openrouter-field' never calls getThinkingSupport(), so no decision is
+   * computed there) and when modelId is empty, so a later phase's
+   * decision-aware hint line can tell "no decision was made" apart from an
+   * actual 'leave' result.
+   */
+  thinkingDecision?: ThinkingDecision;
 }
 
 /** OpenAI-compatible response_format for structured output */
@@ -1030,6 +1042,9 @@ async function chatCompletionStreamingInner(
   // field entirely rather than risk a bad-value fallback.
   const modelId = (resolvedModel || '').toString();
   const profile = getProviderProfile();
+  // Populated on the modelId branch below; stays undefined on the OpenRouter
+  // branch and when modelId is empty (see the JSDoc on StreamingResult).
+  let thinkingDecision: ThinkingDecision | undefined;
 
   if (profile.reasoningStyle === 'openrouter-field') {
     // OpenRouter exposes reasoning as a separate response field and takes a
@@ -1053,10 +1068,19 @@ async function chatCompletionStreamingInner(
     // never fires — the answer then lands in reasoning_content with empty content.
     // HOUTINI_LM_THINKING=off forces no-think for every call regardless of
     // detection (correct when an orchestrator does the reasoning and the local
-    // model only executes). 'on' would force the opposite; unset/'auto' keeps
-    // detection. Only ever suppresses thinking — never fabricates it.
+    // model only executes) and always wins over 'on' or a per-call force —
+    // see thinking-mode.ts. HOUTINI_LM_THINKING=on forces thinking ON for
+    // toggle-capable models. unset/'auto' keeps automatic detection: suppress
+    // when the model is known to support a toggle, leave alone otherwise.
     const thinkingMode = (process.env.HOUTINI_LM_THINKING || 'auto').toLowerCase();
-    if (thinkingMode === 'off' || thinking?.supportsThinkingToggle) {
+    // forceThinking is a literal `false` here — no per-call opt-in exists yet
+    // (a later phase threads a real per-call flag through to this call).
+    thinkingDecision = resolveThinkingDecision({
+      envMode: thinkingMode,
+      forceThinking: false,
+      supportsThinkingToggle: thinking?.supportsThinkingToggle,
+    });
+    if (thinkingDecision === 'suppress-env' || thinkingDecision === 'suppress-auto') {
       body.enable_thinking = false;
       // vLLM's OpenAI server ONLY honours the toggle when it is nested inside
       // chat_template_kwargs; a top-level enable_thinking is silently dropped
@@ -1075,6 +1099,25 @@ async function chatCompletionStreamingInner(
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
       process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+    } else if (thinkingDecision === 'force') {
+      // Only send a positive toggle when the model is actually known to
+      // accept one — gated the same way suppression is above.
+      const toggleSent = thinking?.supportsThinkingToggle === true;
+      if (toggleSent) {
+        body.enable_thinking = true;
+        body.chat_template_kwargs = { ...(body.chat_template_kwargs as Record<string, unknown> | undefined), enable_thinking: true };
+      }
+      // No reasoning_effort here: getReasoningEffortValue() only returns
+      // suppression-oriented values ('none'/'low'), which would fight a
+      // force. Still inflate the budget — forced reasoning consumes part of
+      // it before any visible content, the same risk the suppression path
+      // guards against, just for the opposite reason (deliberate here, not
+      // a vendor quirk ignoring the toggle).
+      const beforeInflation = effectiveMaxTokens;
+      const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
+      body.max_tokens = inflated;
+      body.max_completion_tokens = inflated;
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: thinking FORCED ON (env HOUTINI_LM_THINKING=on), enable_thinking=${toggleSent ? 'true' : '(omitted — model has no known toggle)'}, reasoning_effort=(omitted), max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 
@@ -1469,6 +1512,7 @@ async function chatCompletionStreamingInner(
     reasoningFallback,
     prefillStall,
     streamError,
+    thinkingDecision,
   };
 
   } finally {

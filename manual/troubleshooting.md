@@ -12,6 +12,18 @@ Three fixes, in order:
 2. If your backend serves the model under an alias (`coder-next` instead of the real Qwen id), detection can't recognise it as a thinking model. Set `HOUTINI_LM_THINKING=off` to force no-think on every call.
 3. If you set a small `max_tokens` yourself with `HOUTINI_LM_MIN_TOKENS=0` active, the thinking ate your budget before any visible output. Remove the cap.
 
+## `include_reasoning: true` returns no reasoning block, even though it's a thinking model
+
+**The opposite symptom to the one above — and the expected default.** By design, houtini-lm suppresses a thinking model's reasoning automatically once it's detected (`auto`, the default for `HOUTINI_LM_THINKING`): the model never gets asked to think in the first place, so there's no reasoning to surface regardless of `include_reasoning`. This isn't a bug — the whole point of suppression is that Claude does the reasoning and the local model only executes.
+
+If you actually want the local model's own reasoning surfaced:
+
+1. Set `HOUTINI_LM_THINKING=on` in the MCP server's `env`. For models with a known thinking toggle (Qwen3, Nemotron, DeepSeek R1, GLM-4, gpt-oss, ...) this forces `enable_thinking: true` instead of suppressing it.
+2. Pass `include_reasoning: true` on the call. Without it, the reasoning is still generated but stripped from the response as usual.
+3. Non-thinking models, or thinking models without a known toggle, still won't produce anything to surface — `include_reasoning: true` is a no-op there, not an error.
+
+`off` always overrides `on` — if both are somehow in play (e.g. a shared config), `off` wins and reasoning stays suppressed.
+
 ## Timeouts - the call dies around a minute
 
 **The MCP client's ~60s request timeout, not the server's.** houtini-lm streams progress notifications from the moment the call is acknowledged - per-chunk during generation, heartbeats every 10s during prefill, even before the backend's HTTP headers arrive - and clients that honour `resetTimeoutOnProgress` (Claude Desktop does) will happily sit through multi-minute calls. Clients that ignore the keepalives will kill the request at their timeout regardless of what the server does.

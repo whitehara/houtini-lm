@@ -58,13 +58,13 @@ Two causes, both fixed in source and verified end-to-end against live Qwen3-Code
 2. **Detection gap.** houtini-lm decides whether to send the toggle by identifying the model as a thinking model from Hugging Face metadata — but vLLM serves under arbitrary aliases (e.g. `coder-next`) that resolve to nothing on HF, so a genuine thinking model looked non-thinking and the toggle-branch never ran.
 
 **Fix for the detection gap: `HOUTINI_LM_THINKING`** (`auto` | `off` | `on`, default `auto`).
-- `off` forces the no-think path for every call regardless of detection — the correct setting when Claude orchestrates and the local model only executes, and **required** for any vLLM model served under an alias.
+- `off` forces the no-think path for every call regardless of detection — the correct setting when Claude orchestrates and the local model only executes, and **required** for any vLLM model served under an alias. `off` always wins over `on`.
 - `auto` keeps HF-metadata detection (fine for LM Studio / Ollama where the model id is the real one).
-- `on` forces thinking on.
+- `on` forces thinking **on** for models known to support a toggle: sends `enable_thinking: true` (both the top-level and `chat_template_kwargs` shapes, for the same portability reason as the suppression path), omits `reasoning_effort` entirely (the suppression-oriented values would fight a force), and inflates `max_tokens` so the forced reasoning doesn't starve the visible answer.
 
-Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `scripts/test-vllm-thinking.mjs` (`npm run test:vllm`).
+Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `scripts/test-vllm-thinking.mjs` (`npm run test:vllm`) and `scripts/test-thinking-mode.mjs` (`npm run test:thinking-mode`).
 
-> Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. for hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
+> Note: `off` always overrides `on`. For hard standalone subtasks where you want the local model's own reasoning surfaced, set `HOUTINI_LM_THINKING=on` and pass `include_reasoning: true` on the call — or run a second endpoint with `auto` if the alias problem doesn't apply there.
 
 ## Caveat 2 — tool calls
 
