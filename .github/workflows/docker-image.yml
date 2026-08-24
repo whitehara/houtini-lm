@@ -82,3 +82,41 @@ jobs:
           fi
           docker stop smoke-test
         timeout-minutes: 1
+
+      # Same idea as the stdio smoke test above, but for HOUTINI_LM_TRANSPORT=http:
+      # boots the image in HTTP mode and drives a real MCP initialize handshake
+      # over the wire to confirm the Streamable HTTP transport actually answers.
+      - name: Smoke test (PR — HTTP transport)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm -d --name smoke-http \
+            -p 127.0.0.1:3000:3000 \
+            -e HOUTINI_LM_TRANSPORT=http \
+            -e HOUTINI_LM_ENDPOINT_URL=http://127.0.0.1:9/v1 \
+            houtini-lm:smoke
+          sleep 5
+          curl -sS -D health-headers.txt -o health-body.txt --max-time 20 \
+            http://127.0.0.1:3000/healthz
+          curl -sS -D headers.txt -o body.txt -X POST http://127.0.0.1:3000/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}' \
+            --max-time 20
+          ok=1
+          grep -q "200" health-headers.txt || ok=0
+          grep -q '"status":"ok"' health-body.txt || ok=0
+          grep -qi "mcp-session-id" headers.txt || ok=0
+          grep -q '"result"' body.txt || ok=0
+          grep -q '"serverInfo"' body.txt || ok=0
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::HTTP smoke check failed — /healthz or /mcp response missing expected content"
+            echo "--- health-headers.txt ---"; cat health-headers.txt || true
+            echo "--- health-body.txt ---"; cat health-body.txt || true
+            echo "--- headers.txt ---"; cat headers.txt || true
+            echo "--- body.txt ---"; cat body.txt || true
+            docker logs smoke-http || true
+            docker stop smoke-http || true
+            exit 1
+          fi
+          docker stop smoke-http
+        timeout-minutes: 1

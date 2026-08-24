@@ -43,6 +43,10 @@ ENV HOME=/home/node
 # writes fail with EACCES under the non-root USER below.
 RUN mkdir -p /home/node/.houtini-lm && chown -R node:node /home/node
 
+# Documents the HTTP transport's default port (HOUTINI_LM_TRANSPORT=http);
+# has no effect on stdio mode, which is the default and doesn't listen at all.
+EXPOSE 3000
+
 USER node
 
 ENTRYPOINT ["node", "dist/index.js"]

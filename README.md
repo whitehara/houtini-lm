@@ -113,6 +113,31 @@ Register it with Claude Code the same way, swapping `command`/`args` for `docker
   ```
   Then pass `/workspace/...` paths to `code_task_files`, not the host paths.
 
+### Remote / HTTP transport
+
+By default houtini-lm speaks MCP over stdio — one process per client, as shown above. Set `HOUTINI_LM_TRANSPORT=http` to switch it to Streamable HTTP instead, for a container that stays running and serves multiple clients/sessions:
+
+```bash
+docker run -d -p 3000:3000 \
+  -e HOUTINI_LM_TRANSPORT=http \
+  -e HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234 \
+  -v houtini-lm-state:/home/node/.houtini-lm \
+  ghcr.io/whitehara/houtini-lm:latest
+```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOUTINI_LM_TRANSPORT` | `stdio` | `stdio` (default) or `http`. Any other value fails fast at startup. |
+| `HOUTINI_LM_HTTP_PORT` | `3000` | Port the HTTP server listens on. |
+| `HOUTINI_LM_HTTP_HOST` | `0.0.0.0` | Bind address — `0.0.0.0` so it's reachable from outside the container. |
+| `HOUTINI_LM_HTTP_PATH` | `/mcp` | Path MCP clients POST/DELETE to. |
+
+The server also answers `GET /healthz` with `200 {"status":"ok"}`, independent of `HOUTINI_LM_HTTP_PATH`, for container orchestrator health checks.
+
+Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` header; the response carries the session id in that same header, which the client then sends on every subsequent request. Send `DELETE` with the session id to end a session explicitly — there's currently no idle-session timeout, so a client that never deletes its session leaks it for the life of the process.
+
+**This server does not authenticate HTTP requests.** Don't expose it directly to the internet — put an authenticating reverse proxy (e.g. [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy)) in front of it, and keep the container itself reachable only from that proxy.
+
 ### LLM on a different machine
 
 I've got a GPU box on my local network running Qwen 3 Coder Next in LM Studio. If you've got a similar setup, point the URL at it:
