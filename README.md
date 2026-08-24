@@ -245,6 +245,7 @@ The workhorse. Send a task, get an answer. The description includes planning tri
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). Pass a number to cap it. |
 | `json_schema` | no | - | Force structured JSON output conforming to a schema |
 | `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
+| `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
 
 ### `custom_prompt`
 
@@ -259,6 +260,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `json_schema` | no | - | Force structured JSON output |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
+| `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
 
 ### `code_task`
 
@@ -271,6 +273,7 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 | `language` | no | - | "typescript", "python", "rust", etc. |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
+| `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). |
 
 ### `code_task_files`
 
@@ -285,6 +288,7 @@ Includes a **pre-flight prefill estimator**: if measured per-model data from the
 | `language` | no | - | "typescript", "python", "rust", etc. |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
+| `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). |
 
 ### `embed`
 
@@ -422,6 +426,8 @@ Thinking models burn part of their output budget on invisible reasoning before p
 **OpenRouter** — handles reasoning as a structured per-request parameter and a separate `message.reasoning` response field. Houtini-lm sends `reasoning: { exclude: true }` on every OpenRouter call so thinking models (Nemotron, DeepSeek R1, Qwen3, Claude thinking, gpt-oss, etc.) are normalised to text-only output at the provider level. Budget inflation still fires because some upstream providers bill reasoning tokens against the cap before `exclude` filtering. No stripping is needed — the provider never sends the reasoning in the first place.
 
 The quality footer flags `think-blocks-stripped` when stripping occurred, `reasoning-only` when the fallback fired, and `hit-max-tokens` when the budget ran out — so you know exactly what happened even when the output looks clean.
+
+**Surfacing reasoning on demand** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` accept an `include_reasoning` boolean (default `false`). When `true` and the model produced reasoning, it's appended after the answer, delimited with `---` and a heading, so the caller can verify how a conclusion was reached — useful for review/bug-finding tasks where you want to check the model's reasoning, not just trust the answer. Currently this only surfaces reasoning captured via a separate channel (`delta.reasoning_content` / `delta.reasoning` — LM Studio, DeepSeek R1, Nemotron, Ollama). Inline `<think>...</think>` reasoning is still stripped and discarded rather than captured, so `include_reasoning: true` against a backend that only emits think-blocks currently returns the answer with no reasoning block added — no error, just nothing extra. OpenRouter sends `reasoning: { exclude: true }` on every call regardless of this flag, so `include_reasoning` has no effect there yet.
 
 ## Quality metadata
 

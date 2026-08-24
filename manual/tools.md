@@ -17,6 +17,7 @@ The general-purpose tool. One message in, one response out, routed to the best l
 - `json_schema` - force structured output. Pass a JSON Schema and the response is guaranteed-valid JSON conforming to it. The reliable way to get parseable data out of a small model - much better than asking nicely in the prompt.
 - `seed` + `temperature: 0` - byte-identical output across calls. Deterministic (we've tested it): same seed, same prompt, same bytes. Useful for regression-testing prompts.
 - `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty` - the full sampling set, range-validated server-side, forwarded only when you set them.
+- `include_reasoning` - default `false`. Set `true` to append the model's reasoning after the answer (delimited, so you can check how it got there) when the backend actually returns reasoning. No effect, no error, if the model didn't produce any.
 
 ## custom_prompt
 
@@ -30,11 +31,15 @@ Reach for it when the material and the ask are separate things:
 
 Field discipline: `system` under 30 words, `context` complete and untruncated, `instruction` under 50 words with the output format stated. The narrower the instruction, the better a small model follows it.
 
+Also accepts `include_reasoning` (default `false`) - same as `chat`.
+
 ## code_task
 
 `chat` wrapped in a code-review system prompt with temperature locked low (0.2, or the routed model's own hint). Two required fields - `code` and `task` - plus an optional `language` that shapes the system prompt and measurably improves accuracy. Set it.
 
 Good tasks: explain this function, find bugs, write tests for the error paths, add error handling, convert this pattern. The usual caveat applies double for generated code: it compiles on the model's optimism, not your machine. Read it before you commit it.
+
+Also accepts `include_reasoning` (default `false`) - same as `chat`.
 
 ## code_task_files
 
@@ -46,6 +51,8 @@ The one that changes the economics. Same pipeline as `code_task`, but you pass *
 - A pre-flight estimator checks whether the input's prefill time would blow the MCP client's ~60s request timeout, and refuses early with a diagnostic instead of hanging. It learns your hardware's real speed from measured calls, weights recent samples over stale ones, and won't refuse on a low-confidence estimate. If it fires, split the file list.
 
 Two env vars scope it: `HOUTINI_LM_FILE_ROOTS` confines reads to an allowlist of directories (symlink-resolved), and `HOUTINI_LM_MAX_FILE_MB` caps per-file size (default 10).
+
+Also accepts `include_reasoning` (default `false`) - same as `chat`.
 
 ## embed
 

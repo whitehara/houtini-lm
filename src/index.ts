@@ -37,6 +37,7 @@ import {
 import { acquireInferenceLock } from './inference-lock.js';
 import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
+import { formatReasoningBlock } from './reasoning-block.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -1973,6 +1974,20 @@ const SAMPLING_PROPS = {
   presence_penalty: { type: 'number', description: 'OpenAI-style presence penalty, -2 to 2.' },
 } as const;
 
+// Shared across the four inference tools so the flag's wording and behaviour
+// stay identical everywhere (see formatReasoningBlock in reasoning-block.ts).
+const REASONING_PROP = {
+  include_reasoning: {
+    type: 'boolean',
+    description:
+      'When true and the model actually produced reasoning, append it after the answer, ' +
+      'delimited from the final response, so the conclusion can be verified. ' +
+      'Default false — omitted or false keeps the response compact, unchanged from current behaviour. ' +
+      'Reasoning can run to thousands or tens of thousands of tokens, so only set this when checking ' +
+      'how a conclusion was reached matters. Does not make the model reason — it does not touch thinking/enable_thinking settings.',
+  },
+} as const;
+
 const TOOLS = [
   {
     name: 'chat',
@@ -2021,6 +2036,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
         },
+        ...REASONING_PROP,
         ...SAMPLING_PROPS,
       },
       required: ['message'],
@@ -2073,6 +2089,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...REASONING_PROP,
         ...SAMPLING_PROPS,
       },
       required: ['instruction'],
@@ -2117,6 +2134,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...REASONING_PROP,
         ...SAMPLING_PROPS,
       },
       required: ['code', 'task'],
@@ -2162,6 +2180,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...REASONING_PROP,
         ...SAMPLING_PROPS,
       },
       required: ['paths', 'task'],
@@ -2306,13 +2325,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'chat': {
-        const { message, system, temperature, max_tokens, json_schema, model } = args as {
+        const { message, system, temperature, max_tokens, json_schema, model, include_reasoning } = args as {
           message: string;
           system?: string;
           temperature?: number;
           max_tokens?: number;
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
           model?: string;
+          include_reasoning?: boolean;
         };
 
         const route = await routeToModel('chat', model);
@@ -2340,12 +2360,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
         const footer = formatFooter(resp);
-        return { content: [{ type: 'text', text: resp.content + footer }] };
+        return { content: [{ type: 'text', text: resp.content + reasoningBlock + footer }] };
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema, model } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning } = args as {
           system?: string;
           context?: string;
           instruction: string;
@@ -2353,6 +2374,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_tokens?: number;
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
           model?: string;
+          include_reasoning?: boolean;
         };
 
         const route = await routeToModel('analysis', model);
@@ -2388,19 +2410,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
         const footer = formatFooter(resp);
         return {
-          content: [{ type: 'text', text: resp.content + footer }],
+          content: [{ type: 'text', text: resp.content + reasoningBlock + footer }],
         };
       }
 
       case 'code_task': {
-        const { code, task, language, max_tokens: codeMaxTokens, model } = args as {
+        const { code, task, language, max_tokens: codeMaxTokens, model, include_reasoning } = args as {
           code: string;
           task: string;
           language?: string;
           max_tokens?: number;
           model?: string;
+          include_reasoning?: boolean;
         };
 
         const lang = language || 'unknown';
@@ -2435,18 +2459,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        const reasoningBlock = formatReasoningBlock(include_reasoning, codeResp);
         const codeFooter = formatFooter(codeResp, lang);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+        return { content: [{ type: 'text', text: codeResp.content + reasoningBlock + codeFooter + suggestionLine }] };
       }
 
       case 'code_task_files': {
-        const { paths, task, language, max_tokens: codeMaxTokens, model } = args as {
+        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning } = args as {
           paths: string[];
           task: string;
           language?: string;
           max_tokens?: number;
           model?: string;
+          include_reasoning?: boolean;
         };
 
         if (!Array.isArray(paths) || paths.length === 0) {
@@ -2573,9 +2599,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const readSummary = successCount === paths.length
           ? `${paths.length} file(s) read`
           : `${successCount}/${paths.length} file(s) read`;
+        const reasoningBlock = formatReasoningBlock(include_reasoning, codeResp);
         const codeFooter = formatFooter(codeResp, `${lang} · ${readSummary}`);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+        return { content: [{ type: 'text', text: codeResp.content + reasoningBlock + codeFooter + suggestionLine }] };
       }
 
       case 'discover': {
