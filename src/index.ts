@@ -13,12 +13,23 @@ import './suppress-experimental-warnings.js';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  type CallToolRequest,
+  type CallToolResult,
+  type ReadResourceRequest,
+  type ReadResourceResult,
+  type ListResourcesResult,
+  type ListToolsResult,
+  type ServerNotification,
+  type ServerRequest,
+  type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   profileModelsAtStartup,
   getCachedProfile,
@@ -42,6 +53,9 @@ import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
+import { createServer as createHttpServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
 
 // Env var naming: HOUTINI_LM_* is the preferred namespace now that we
 // support more than just LM Studio. The legacy LM_STUDIO_* names remain
@@ -2091,7 +2105,7 @@ const REASONING_PROPS = {
   },
 } as const;
 
-const TOOLS = [
+const TOOLS: Tool[] = [
   {
     name: 'chat',
     description:
@@ -2368,7 +2382,7 @@ const server = new Server(
 // Exposes session performance metrics as a readable resource so Claude can
 // proactively check offload efficiency and make smarter delegation decisions.
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+const handleListResources = async (): Promise<ListResourcesResult> => ({
   resources: [
     {
       uri: 'houtini://metrics/session',
@@ -2377,9 +2391,9 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       mimeType: 'application/json',
     },
   ],
-}));
+});
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+const handleReadResource = async (request: ReadResourceRequest): Promise<ReadResourceResult> => {
   const { uri } = request.params;
 
   if (uri === 'houtini://metrics/session') {
@@ -2413,11 +2427,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   throw new Error(`Unknown resource: ${uri}`);
-});
+};
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+const handleListTools = async (): Promise<ListToolsResult> => ({ tools: TOOLS });
 
-server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+type HoutiniExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Promise<CallToolResult> => {
   const { name } = request.params;
   // `arguments` is optional in the MCP CallTool schema — a client may omit it
   // entirely for a param-less tool (e.g. `stats` with no filter). Default to an
@@ -3047,12 +3063,154 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       isError: true,
     };
   }
-});
+};
+
+// HTTP transports need a fresh Server instance per session: a single
+// StreamableHTTPServerTransport keys its response streams by JSON-RPC
+// request id, so two concurrent sessions that both open with id 1 would
+// collide and cross their responses. Stdio has exactly one peer, so it
+// keeps using the single module-level `server` instance registered below.
+function createHoutiniServer(): Server {
+  const s = new Server(
+    { name: 'houtini-lm', version: SERVER_VERSION },
+    { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
+  );
+  s.setRequestHandler(ListResourcesRequestSchema, handleListResources);
+  s.setRequestHandler(ReadResourceRequestSchema, handleReadResource);
+  s.setRequestHandler(ListToolsRequestSchema, handleListTools);
+  s.setRequestHandler(CallToolRequestSchema, handleCallTool);
+  return s;
+}
+
+server.setRequestHandler(ListResourcesRequestSchema, handleListResources);
+server.setRequestHandler(ReadResourceRequestSchema, handleReadResource);
+server.setRequestHandler(ListToolsRequestSchema, handleListTools);
+server.setRequestHandler(CallToolRequestSchema, handleCallTool);
+
+// ── Remote (HTTP) transport ─────────────────────────────────────────
+// Opt-in: unset/'stdio' leaves the single-peer stdio path (above) completely
+// unchanged. 'http' switches to Streamable HTTP for containerised/remote
+// deployments — see README for the mcp-auth-proxy sidecar story. This server
+// does not authenticate HTTP requests itself.
+const HOUTINI_LM_TRANSPORT = (process.env.HOUTINI_LM_TRANSPORT || 'stdio').toLowerCase();
+const HOUTINI_LM_HTTP_PORT = Math.max(1, parseInt(process.env.HOUTINI_LM_HTTP_PORT || '3000', 10) || 3000);
+const HOUTINI_LM_HTTP_HOST = process.env.HOUTINI_LM_HTTP_HOST || '0.0.0.0';
+const HOUTINI_LM_HTTP_PATH = process.env.HOUTINI_LM_HTTP_PATH || '/mcp';
+
+if (HOUTINI_LM_TRANSPORT !== 'stdio' && HOUTINI_LM_TRANSPORT !== 'http') {
+  process.stderr.write(`[houtini-lm] Invalid HOUTINI_LM_TRANSPORT="${HOUTINI_LM_TRANSPORT}" — expected "stdio" or "http".\n`);
+  process.exit(1);
+}
+
+type HoutiniSession = { server: Server; transport: StreamableHTTPServerTransport };
+
+/**
+ * Streamable HTTP entry point. Each new session (a POST with no
+ * mcp-session-id) gets its own Server + transport pair so that concurrent
+ * clients never share a request-id space — see createHoutiniServer() above.
+ * Sessions persist in `sessions` until the client sends DELETE or the
+ * transport reports onclose.
+ */
+async function startHttpTransport(): Promise<void> {
+  const sessions = new Map<string, HoutiniSession>();
+
+  const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+    void handleHttpRequest(req, res).catch((err) => {
+      process.stderr.write(`[houtini-lm] HTTP request failed: ${err instanceof Error ? err.stack || err.message : err}\n`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+      } else {
+        res.end();
+      }
+    });
+  });
+
+  async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+
+    if (req.method === 'GET' && url.pathname === '/healthz') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
+    if (url.pathname !== HOUTINI_LM_HTTP_PATH) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+
+    const sessionIdHeader = req.headers['mcp-session-id'];
+    const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+
+    if (sessionId !== undefined) {
+      const existing = sessions.get(sessionId);
+      if (!existing) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null }));
+        return;
+      }
+      await existing.transport.handleRequest(req, res);
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Missing session ID' }, id: null }));
+      return;
+    }
+
+    const newServer = createHoutiniServer();
+    // enableJsonResponse is intentionally omitted (default false = SSE):
+    // setting it true makes the SDK answer each request with a single JSON
+    // body instead of an SSE stream, and notifications/progress is only
+    // written to the SSE branch — turning this on would silently kill the
+    // keepalive pings during long inference calls.
+    // enableDnsRebindingProtection is intentionally omitted (default false):
+    // this server sits behind mcp-auth-proxy, which terminates the public
+    // Host header before proxying here, so protection belongs there.
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        sessions.set(sid, { server: newServer, transport });
+      },
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) sessions.delete(transport.sessionId);
+    };
+    await newServer.connect(transport);
+    // Do not pre-read `req` — handing it to handleRequest as a live stream
+    // lets the transport parse the body itself. Reading it first would
+    // consume the stream and hang the transport's own read.
+    await transport.handleRequest(req, res);
+  }
+
+  await new Promise<void>((resolve) => {
+    httpServer.listen(HOUTINI_LM_HTTP_PORT, HOUTINI_LM_HTTP_HOST, () => resolve());
+  });
+  process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)}) — http transport on ${HOUTINI_LM_HTTP_HOST}:${HOUTINI_LM_HTTP_PORT}${HOUTINI_LM_HTTP_PATH}\n`);
+
+  const shutdown = () => {
+    void (async () => {
+      for (const { transport } of sessions.values()) {
+        await transport.close().catch(() => {});
+      }
+      httpServer.close(() => process.exit(0));
+    })();
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)})\n`);
+  if (HOUTINI_LM_TRANSPORT === 'http') {
+    await startHttpTransport();
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)})\n`);
+  }
 
   // Background: profile all available models via HF → SQLite cache
   // Non-blocking — server is already accepting requests
