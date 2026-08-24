@@ -76,12 +76,12 @@ That's it. If LM Studio's running on `localhost:1234` (the default), Claude can 
 
 ### Run in Docker
 
-Prebuilt images are published to GHCR on every push to `main` and every tagged release. **`:latest` only exists once the first `v*` tag has been pushed** — until then, use the `:main` tag (or a commit-SHA tag):
+Prebuilt images are published to GHCR when a `vX.Y.Z` tag is pushed (or via manual `workflow_dispatch`) — pushes to `main` alone don't trigger a build. **`:latest` only exists once the first `v*.*.*` tag has been pushed**; until then, build locally or use a commit-SHA tag from the Actions run:
 
 ```bash
 docker run --rm -i \
   -e HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234 \
-  ghcr.io/whitehara/houtini-lm:main
+  ghcr.io/whitehara/houtini-lm:latest
 ```
 
 Register it with Claude Code the same way, swapping `command`/`args` for `docker`:
@@ -95,7 +95,7 @@ Register it with Claude Code the same way, swapping `command`/`args` for `docker
         "run", "--rm", "-i",
         "-e", "HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234",
         "-v", "houtini-lm-state:/home/node/.houtini-lm",
-        "ghcr.io/whitehara/houtini-lm:main"
+        "ghcr.io/whitehara/houtini-lm:latest"
       ]
     }
   }
@@ -109,7 +109,7 @@ Register it with Claude Code the same way, swapping `command`/`args` for `docker
   docker run --rm -i \
     -e HOUTINI_LM_ENDPOINT_URL=http://host.docker.internal:1234 \
     -v /path/to/your/project:/workspace:ro \
-    ghcr.io/whitehara/houtini-lm:main
+    ghcr.io/whitehara/houtini-lm:latest
   ```
   Then pass `/workspace/...` paths to `code_task_files`, not the host paths.
 
