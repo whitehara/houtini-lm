@@ -246,6 +246,7 @@ The workhorse. Send a task, get an answer. The description includes planning tri
 | `json_schema` | no | - | Force structured JSON output conforming to a schema |
 | `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
+| `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
 
 ### `custom_prompt`
 
@@ -261,6 +262,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `json_schema` | no | - | Force structured JSON output |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
+| `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
 
 ### `code_task`
 
@@ -274,6 +276,7 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). |
+| `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
 
 ### `code_task_files`
 
@@ -289,6 +292,7 @@ Includes a **pre-flight prefill estimator**: if measured per-model data from the
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). |
+| `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
 
 ### `embed`
 
@@ -429,6 +433,8 @@ The quality footer flags `think-blocks-stripped` when stripping occurred, `reaso
 
 **Surfacing reasoning on demand** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` accept an `include_reasoning` boolean (default `false`). When `true` and the model produced reasoning, it's appended after the answer, delimited with `---` and a heading, so the caller can verify how a conclusion was reached — useful for review/bug-finding tasks where you want to check the model's reasoning, not just trust the answer. This works with both reasoning delivery shapes: a separate channel (`delta.reasoning_content` / `delta.reasoning` — LM Studio, DeepSeek R1, Nemotron, Ollama) and inline `<think>...</think>` blocks on the content channel (captured before being stripped from the visible answer, same as step 3 above) — so it surfaces reasoning on local backends (LM Studio, vLLM, Ollama) either way. If a model somehow emits both, the separate channel wins and the captured think-block text is discarded rather than duplicated. OpenRouter sends `reasoning: { exclude: true }` on every call regardless of this flag, so `include_reasoning` has no effect there yet.
 
+Toggle-capable models (Qwen3, Nemotron, DeepSeek R1, GLM-4, gpt-oss, ...) have their thinking suppressed automatically by default (see [Think-block handling](#think-block-handling)) — so `include_reasoning: true` alone gets you nothing to show on those models; there's no reasoning generated in the first place. Pass `force_thinking: true` alongside it to disable suppression for that one call. `HOUTINI_LM_THINKING=off` always wins over `force_thinking` — an operator running the server with thinking locked off (e.g. a vLLM alias deployment that depends on it) can't have that overridden per call. When `include_reasoning: true` is set but no reasoning comes back, the response explains why instead of silently returning nothing extra — e.g. "houtini-lm suppressed its thinking automatically. Pass `force_thinking: true`...".
+
 ## Quality metadata
 
 Every response includes structured quality signals in the footer so Claude (or any orchestrator) can make informed trust decisions:
@@ -483,7 +489,7 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable just the cross-process inference lock (keeps the in-process semaphore). |
 | `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to disable inference serialisation entirely (both the in-process semaphore and the cross-process lock). Use for backends that batch natively (vLLM, TGI, SGLang) where one-at-a-time only throttles throughput. |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Values below the floor are ignored and the dynamic budget (25% of the model's context window) applies — MCP clients habitually pass tiny caps like 256 that strangle reasoning models. Set to `0` to honour any value (e.g. deliberate micro-chunking on slow hardware). |
-| `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model and suppresses it when detected, `off` forces the no-think path for every call, `on` forces thinking on for models known to support a toggle (sends `enable_thinking: true`, skips `reasoning_effort`, and inflates `max_tokens` the same way suppression does). `off` always wins — it overrides `on` and any future per-call opt-in. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes — and **required for vLLM served under an alias** (e.g. `coder-next`), where HF-metadata detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Use `on` when you want the local model's own reasoning surfaced via `include_reasoning: true`. |
+| `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model and suppresses it when detected, `off` forces the no-think path for every call, `on` forces thinking on for models known to support a toggle (sends `enable_thinking: true`, skips `reasoning_effort`, and inflates `max_tokens` the same way suppression does). `off` always wins — it overrides both `on` and a per-call `force_thinking: true`. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes — and **required for vLLM served under an alias** (e.g. `coder-next`), where HF-metadata detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Use `on` (server-wide) or `force_thinking: true` (per call) when you want the local model's own reasoning surfaced via `include_reasoning: true`. |
 
 **Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 

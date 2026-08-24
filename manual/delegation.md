@@ -55,6 +55,7 @@ Modern local models (Qwen3, DeepSeek, Nemotron) think before they answer, and th
 1. **Never set small output caps.** The thinking eats them and you get empty output at full inference price. This is exactly why the server floors `max_tokens` at 4,096 and defaults to 25% of context.
 2. **Suppress thinking when Claude's doing the orchestration.** If a frontier model designed the task, the local model shouldn't re-reason it - it should execute. houtini-lm sends the no-think toggle automatically for models it recognises; when your backend serves an alias (vLLM serving `coder-next` rather than the model's real id), detection can't fire, so set `HOUTINI_LM_THINKING=off` and it's forced on every call.
 3. **Watch the reasoning ratio in `stats`.** It's the drift alarm - if the overhead climbs, your no-think config stopped landing somewhere.
+4. **Occasionally you want the opposite** - a hard standalone subtask where the local model's own step-by-step reasoning is worth seeing (debugging a gnarly edge case, say). Pass `force_thinking: true` on that one call instead of flipping the server-wide setting; combine with `include_reasoning: true` to actually see what it produced.
 
 ## Trust, but verify - proportionally
 

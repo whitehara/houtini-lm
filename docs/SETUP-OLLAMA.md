@@ -76,6 +76,8 @@ Three things are handled for you. They're worth knowing because they explain beh
 
 **Reasoning arrives on a different channel.** Ollama's OpenAI-compatible endpoint streams thinking-model reasoning on `delta.reasoning`, where vLLM uses `reasoning_content` and some models emit `<think>` inline. houtini-lm reads all three and strips them, so you get the answer rather than the working out. Qwen3 on Ollama is the awkward case — it streams reasoning directly and can produce an orphan `</think>` closer with no opener, which is handled explicitly.
 
+Want to actually see a Qwen3 model's reasoning instead of having it stripped? Pass `include_reasoning: true` **and** `force_thinking: true` on the call — thinking is suppressed by default (that's what keeps small models from burning their whole output budget on invisible reasoning), so `include_reasoning` alone has nothing to show.
+
 ## Gotchas
 
 **A model name is always required.** Ollama returns `HTTP 400: model is required` if the field is absent, where some backends infer a default. houtini-lm always sends one, but if you're testing with raw `curl` against `/v1/chat/completions`, that's the error you'll get for omitting it.

@@ -836,6 +836,14 @@ interface InferenceOptions {
   responseFormat?: ResponseFormat;
   progressToken?: string | number;
   sampling?: SamplingParams;
+  /**
+   * Per-call opt-in to force thinking on for this request only. Does not
+   * override HOUTINI_LM_THINKING=off — the env var is an operator-level
+   * safety net (e.g. vLLM-behind-an-alias deployments) that a single caller
+   * must not be able to defeat. See resolveThinkingDecision() in
+   * thinking-mode.ts for the full precedence.
+   */
+  forceThinking?: boolean;
 }
 
 /**
@@ -1073,11 +1081,9 @@ async function chatCompletionStreamingInner(
     // toggle-capable models. unset/'auto' keeps automatic detection: suppress
     // when the model is known to support a toggle, leave alone otherwise.
     const thinkingMode = (process.env.HOUTINI_LM_THINKING || 'auto').toLowerCase();
-    // forceThinking is a literal `false` here — no per-call opt-in exists yet
-    // (a later phase threads a real per-call flag through to this call).
     thinkingDecision = resolveThinkingDecision({
       envMode: thinkingMode,
-      forceThinking: false,
+      forceThinking: options.forceThinking,
       supportsThinkingToggle: thinking?.supportsThinkingToggle,
     });
     if (thinkingDecision === 'suppress-env' || thinkingDecision === 'suppress-auto') {
@@ -1117,7 +1123,8 @@ async function chatCompletionStreamingInner(
       const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
-      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: thinking FORCED ON (env HOUTINI_LM_THINKING=on), enable_thinking=${toggleSent ? 'true' : '(omitted — model has no known toggle)'}, reasoning_effort=(omitted), max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+      const forceTrigger = thinkingMode === 'on' ? 'env HOUTINI_LM_THINKING=on' : 'per-call force_thinking=true';
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: thinking FORCED ON (${forceTrigger}), enable_thinking=${toggleSent ? 'true' : '(omitted — model has no known toggle)'}, reasoning_effort=(omitted), max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 
@@ -1443,8 +1450,10 @@ async function chatCompletionStreamingInner(
   }
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
-  // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Stripped from
-  // the visible answer by default — but captured into capturedThinkBlocks so
+  // inline on the content channel (e.g. GLM Flash, Ollama Qwen3) — including a
+  // model whose thinking was force_thinking'd on for this call but that has no
+  // separate reasoning channel, so it thinks inline instead. Stripped from the
+  // visible answer by default — but captured into capturedThinkBlocks so
   // include_reasoning can surface it on request (see reasoningContent below).
   // Handle three shapes:
   //   1. Balanced  <think>...</think>  — GLM Flash, Nemotron normal case
@@ -2036,9 +2045,10 @@ const SAMPLING_PROPS = {
   presence_penalty: { type: 'number', description: 'OpenAI-style presence penalty, -2 to 2.' },
 } as const;
 
-// Shared across the four inference tools so the flag's wording and behaviour
-// stay identical everywhere (see formatReasoningBlock in reasoning-block.ts).
-const REASONING_PROP = {
+// Shared across the four inference tools so the flags' wording and behaviour
+// stay identical everywhere (see formatReasoningBlock in reasoning-block.ts
+// and resolveThinkingDecision in thinking-mode.ts).
+const REASONING_PROPS = {
   include_reasoning: {
     type: 'boolean',
     description:
@@ -2046,7 +2056,17 @@ const REASONING_PROP = {
       'delimited from the final response, so the conclusion can be verified. ' +
       'Default false — omitted or false keeps the response compact, unchanged from current behaviour. ' +
       'Reasoning can run to thousands or tens of thousands of tokens, so only set this when checking ' +
-      'how a conclusion was reached matters. Does not make the model reason — it does not touch thinking/enable_thinking settings.',
+      'how a conclusion was reached matters. Does not make the model reason on its own — most routed models ' +
+      'have their thinking suppressed automatically, so pair this with force_thinking: true to actually get any.',
+  },
+  force_thinking: {
+    type: 'boolean',
+    description:
+      'Default false. When true, disables the server\'s automatic thinking suppression for this one call so ' +
+      'the model actually thinks — increasing latency and generated tokens. Pair with include_reasoning: true ' +
+      'to see the result; force_thinking alone still returns only the final answer. Ignored (no-op) when the ' +
+      'server is run with HOUTINI_LM_THINKING=off — that is an operator-level setting a single call cannot ' +
+      'override. Currently has no effect on OpenRouter-routed calls.',
   },
 } as const;
 
@@ -2098,7 +2118,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
         },
-        ...REASONING_PROP,
+        ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
       required: ['message'],
@@ -2151,7 +2171,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
-        ...REASONING_PROP,
+        ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
       required: ['instruction'],
@@ -2196,7 +2216,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
-        ...REASONING_PROP,
+        ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
       required: ['code', 'task'],
@@ -2242,7 +2262,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
-        ...REASONING_PROP,
+        ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
       required: ['paths', 'task'],
@@ -2387,7 +2407,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'chat': {
-        const { message, system, temperature, max_tokens, json_schema, model, include_reasoning } = args as {
+        const { message, system, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking } = args as {
           message: string;
           system?: string;
           temperature?: number;
@@ -2395,6 +2415,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
           model?: string;
           include_reasoning?: boolean;
+          force_thinking?: boolean;
         };
 
         const route = await routeToModel('chat', model);
@@ -2420,6 +2441,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           responseFormat,
           progressToken,
           sampling: extractSamplingParams(args as Record<string, unknown>),
+          forceThinking: force_thinking === true,
         });
 
         const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
@@ -2428,7 +2450,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking } = args as {
           system?: string;
           context?: string;
           instruction: string;
@@ -2437,6 +2459,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
           model?: string;
           include_reasoning?: boolean;
+          force_thinking?: boolean;
         };
 
         const route = await routeToModel('analysis', model);
@@ -2470,6 +2493,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           responseFormat,
           progressToken,
           sampling: extractSamplingParams(args as Record<string, unknown>),
+          forceThinking: force_thinking === true,
         });
 
         const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
@@ -2480,13 +2504,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'code_task': {
-        const { code, task, language, max_tokens: codeMaxTokens, model, include_reasoning } = args as {
+        const { code, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking } = args as {
           code: string;
           task: string;
           language?: string;
           max_tokens?: number;
           model?: string;
           include_reasoning?: boolean;
+          force_thinking?: boolean;
         };
 
         const lang = language || 'unknown';
@@ -2519,6 +2544,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           model: route.modelId,
           progressToken,
           sampling: extractSamplingParams(args as Record<string, unknown>),
+          forceThinking: force_thinking === true,
         });
 
         const reasoningBlock = formatReasoningBlock(include_reasoning, codeResp);
@@ -2528,13 +2554,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'code_task_files': {
-        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning } = args as {
+        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking } = args as {
           paths: string[];
           task: string;
           language?: string;
           max_tokens?: number;
           model?: string;
           include_reasoning?: boolean;
+          force_thinking?: boolean;
         };
 
         if (!Array.isArray(paths) || paths.length === 0) {
@@ -2656,6 +2683,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           model: route.modelId,
           progressToken,
           sampling: extractSamplingParams(args as Record<string, unknown>),
+          forceThinking: force_thinking === true,
         });
 
         const readSummary = successCount === paths.length

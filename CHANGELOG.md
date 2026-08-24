@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- **`force_thinking`** (boolean, default `false`) — per-call opt-in on `chat` / `custom_prompt` / `code_task` / `code_task_files` that disables automatic thinking suppression for that one request, so a toggle-capable model actually thinks. `HOUTINI_LM_THINKING=off` still wins — a single call can't override the operator-level setting. Pair with `include_reasoning: true` to see the result; when reasoning still comes back empty (server suppressed it, `off` is set, or the model ignored the forced toggle), the response now explains which of those happened instead of silently returning nothing extra.
+
 ### Fixed
 - **`HOUTINI_LM_THINKING=on` was a no-op.** README and `docs/VLLM-BACKEND.md` documented `on` as forcing thinking on, but the implementation's condition (`thinkingMode === 'off' || thinking?.supportsThinkingToggle`) never checked for `'on'` at all — toggle-capable models stayed suppressed regardless of the setting. Thinking-decision logic (suppress via env, suppress via auto-detection, force, or leave alone) is now extracted into `src/thinking-mode.ts` (`resolveThinkingDecision()`, unit-tested via `npm run test:thinking-mode`) with `'off'` as a hard-precedence floor over `'on'`. When forced on, `reasoning_effort` is omitted (its values are suppression-oriented and would fight the force) and `max_tokens` is inflated the same way the suppression path already does, so forced reasoning doesn't starve the visible answer.
 
