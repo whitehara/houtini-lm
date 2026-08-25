@@ -7,13 +7,8 @@
  *
  * Usage: node scripts/test-http-transport.mjs
  */
-import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { startFakeBackend } from './fake-openai-backend.mjs';
-
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+import { getFreePort, startServer, post, initializeSession } from './http-test-helpers.mjs';
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -26,104 +21,16 @@ function check(name, cond, detail) {
   }
 }
 
-/** Grab an OS-assigned free port without racing the server we're about to spawn. */
-function getFreePort() {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-    srv.on('error', reject);
-  });
-}
-
-function startServer(backendUrl, port) {
-  const child = spawn(process.execPath, [path.join(repoRoot, 'dist', 'index.js')], {
-    env: {
-      ...process.env,
-      HOUTINI_LM_ENDPOINT_URL: backendUrl,
-      HOUTINI_LM_TRANSPORT: 'http',
-      HOUTINI_LM_HTTP_HOST: '127.0.0.1',
-      HOUTINI_LM_HTTP_PORT: String(port),
-    },
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-
-  const ready = new Promise((resolve, reject) => {
-    let buf = '';
-    const timer = setTimeout(() => reject(new Error('server did not print startup line in time')), 15_000);
-    child.stderr.on('data', (chunk) => {
-      buf += chunk.toString('utf8');
-      if (buf.includes('Houtini LM server running')) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`server exited early with code ${code}. stderr:\n${buf}`));
-    });
-  });
-
-  return { child, ready };
-}
-
-/** Parses an SSE (or plain JSON) response body into the JSON-RPC messages it carries. */
-function parseSseOrJson(text, contentType) {
-  if (contentType && contentType.includes('text/event-stream')) {
-    const messages = [];
-    for (const block of text.split('\n\n')) {
-      const dataLines = block.split('\n').filter((l) => l.startsWith('data:'));
-      if (dataLines.length === 0) continue;
-      const data = dataLines.map((l) => l.slice(5).trim()).join('\n');
-      try {
-        messages.push(JSON.parse(data));
-      } catch { /* ignore non-JSON SSE lines */ }
-    }
-    return messages;
-  }
-  try {
-    return [JSON.parse(text)];
-  } catch {
-    return [];
-  }
-}
-
-async function post(baseUrl, path_, body, sessionId) {
-  const headers = {
-    'Content-Type': 'application/json',
-    Accept: 'application/json, text/event-stream',
-  };
-  if (sessionId) headers['mcp-session-id'] = sessionId;
-  const res = await fetch(`${baseUrl}${path_}`, { method: 'POST', headers, body: JSON.stringify(body) });
-  const text = await res.text();
-  const messages = parseSseOrJson(text, res.headers.get('content-type'));
-  return { status: res.status, headers: res.headers, messages };
-}
-
 /** Runs one full session: initialize -> initialized -> tools/call(progressToken), returns collected messages. */
 async function runOneSession(baseUrl, progressToken) {
-  const initRes = await post(baseUrl, '/mcp', {
-    jsonrpc: '2.0', id: 1, method: 'initialize',
-    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'http-test', version: '0.1.0' } },
-  });
-  const sessionId = initRes.headers.get('mcp-session-id');
-  if (!sessionId) throw new Error('no mcp-session-id header on initialize response');
-
-  // Fire-and-forget per JSON-RPC notification semantics (no id, no response expected).
-  await fetch(`${baseUrl}/mcp`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId },
-    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
-  });
+  const { sessionId, initMessages } = await initializeSession(baseUrl, '/mcp');
 
   const callRes = await post(baseUrl, '/mcp', {
     jsonrpc: '2.0', id: 2, method: 'tools/call',
     params: { name: 'chat', arguments: { message: 'hi', max_tokens: 64 }, _meta: { progressToken } },
   }, sessionId);
 
-  return { sessionId, initMessages: initRes.messages, callMessages: callRes.messages };
+  return { sessionId, initMessages, callMessages: callRes.messages };
 }
 
 async function main() {

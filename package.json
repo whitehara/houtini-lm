@@ -14,6 +14,7 @@
     "test:reasoning": "node scripts/test-reasoning.mjs",
     "test:thinking-mode": "node scripts/test-thinking-mode.mjs",
     "test:conversations": "node scripts/test-conversation-store.mjs",
+    "test:conversations:e2e": "node scripts/test-conversations-e2e.mjs",
     "test:progress": "node scripts/test-progress-notifications.mjs",
     "test:http": "node scripts/test-http-transport.mjs",
     "test:lock": "node scripts/verify-inference-lock.mjs",

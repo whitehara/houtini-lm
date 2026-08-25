@@ -7,6 +7,12 @@
 import { createServer } from 'node:http';
 
 export function startFakeBackend({ port = 0 } = {}) {
+  // Every parsed /v1/chat/completions request body, in arrival order — lets
+  // callers assert on what houtini-lm actually sent upstream (e.g. that a
+  // conversation's stored history was prepended to `messages`). reset()
+  // clears it between test cases without needing a fresh server instance.
+  const requests = [];
+
   const server = createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -27,6 +33,7 @@ export function startFakeBackend({ port = 0 } = {}) {
         } catch {
           parsed = {};
         }
+        requests.push(parsed);
 
         if (parsed.stream) {
           res.writeHead(200, {
@@ -91,6 +98,8 @@ export function startFakeBackend({ port = 0 } = {}) {
       resolve({
         url: `http://127.0.0.1:${addr.port}`,
         close: () => new Promise((res2) => server.close(() => res2())),
+        requests,
+        reset: () => { requests.length = 0; },
       });
     });
   });

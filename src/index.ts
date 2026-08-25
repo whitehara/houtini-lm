@@ -50,6 +50,7 @@ import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
 import { formatReasoningBlock } from './reasoning-block.js';
 import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.js';
+import { ConversationStore, formatConversationLine, type ConversationTurn } from './conversation-store.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -415,6 +416,23 @@ function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
   inferenceLock = next;
   return wait.then(fn).finally(() => release!());
 }
+
+// ── Server-side conversation history (chat) ──────────────────────────
+// Default on: HOUTINI_LM_CONVERSATIONS=0 (or false/no/off) disables the
+// feature entirely — CONVERSATION_PROPS is then left out of the tool schema
+// (see TOOLS below) and any start_conversation/conversation_id argument
+// becomes a hard error instead of being silently ignored (see handleCallTool).
+const CONVERSATIONS_ENABLED = !/^(0|false|no|off)$/i.test(process.env.HOUTINI_LM_CONVERSATIONS || '');
+const CONVERSATION_TTL_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_TTL_MIN || '60', 10) || 60);
+const CONVERSATION_MAX = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX || '50', 10) || 50);
+const CONVERSATION_MAX_TURNS = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX_TURNS || '40', 10) || 40);
+const CONVERSATION_MAX_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX_CHARS || '48000', 10) || 48000);
+const conversations = new ConversationStore({
+  ttlMs: CONVERSATION_TTL_MIN * 60_000,
+  maxConversations: CONVERSATION_MAX,
+  maxTurns: CONVERSATION_MAX_TURNS,
+  maxChars: CONVERSATION_MAX_CHARS,
+});
 
 // ── OpenAI-compatible API helpers ────────────────────────────────────
 
@@ -2105,6 +2123,29 @@ const REASONING_PROPS = {
   },
 } as const;
 
+// Only added to chat's inputSchema.properties when CONVERSATIONS_ENABLED (see
+// the conditional spread in TOOLS below). By default this server remembers
+// nothing between calls — these two params opt a single MCP connection into
+// server-side history so the caller stops resending the full transcript.
+const CONVERSATION_PROPS = {
+  start_conversation: {
+    type: 'boolean',
+    description:
+      'By default this server remembers nothing between calls — every call is stateless unless you opt in here. ' +
+      'Set true to start a new server-side conversation — the id is returned on the last line of the response. ' +
+      'On every following call in this conversation, pass that id as conversation_id and send ONLY the new ' +
+      'message; do not resend prior turns, the server already has them. If the id expires (idle timeout) or ' +
+      'stops working, start a new conversation rather than retrying the old id.',
+  },
+  conversation_id: {
+    type: 'string',
+    description:
+      'Continue a conversation previously started with start_conversation: true. Send ONLY the new message — ' +
+      'the server prepends the stored history automatically. If both start_conversation and conversation_id are ' +
+      'given, conversation_id wins and start_conversation is ignored.',
+  },
+} as const;
+
 const TOOLS: Tool[] = [
   {
     name: 'chat',
@@ -2153,6 +2194,7 @@ const TOOLS: Tool[] = [
           type: 'string',
           description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
         },
+        ...(CONVERSATIONS_ENABLED ? CONVERSATION_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
@@ -2445,7 +2487,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
   try {
     switch (name) {
       case 'chat': {
-        const { message, system, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking } = args as {
+        const { message, system, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id } = args as {
           message: string;
           system?: string;
           temperature?: number;
@@ -2454,7 +2496,66 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           model?: string;
           include_reasoning?: boolean;
           force_thinking?: boolean;
+          start_conversation?: boolean;
+          conversation_id?: string;
         };
+
+        // Both unspecified → skip every conversation branch below and take the
+        // exact code path this tool already had (default behaviour untouched).
+        const wantsConversation = start_conversation !== undefined || conversation_id !== undefined;
+
+        if (wantsConversation && !CONVERSATIONS_ENABLED) {
+          return {
+            content: [{ type: 'text', text: 'Error: この houtini-lm インスタンスでは会話保持が無効です。' }],
+            isError: true,
+          };
+        }
+
+        // Session-ID resolution rule (the multi-tenant safety boundary — see
+        // conversation-store.ts's header comment for why owner scoping exists
+        // at all). HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's
+        // a reliable way to know which resolution applies; never fall back to
+        // a fixed key over HTTP, or two different callers could share history.
+        let conversationOwner: string | undefined;
+        if (wantsConversation) {
+          if (HOUTINI_LM_TRANSPORT === 'stdio') {
+            conversationOwner = 'stdio-local';
+          } else if (extra.sessionId === undefined) {
+            return {
+              content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
+              isError: true,
+            };
+          } else {
+            conversationOwner = extra.sessionId;
+          }
+        }
+
+        // conversation_id wins when both are given — start_conversation is
+        // simply ignored, noted on the trailing conversation line below.
+        let history: ConversationTurn[] = [];
+        let activeConversationId: string | undefined;
+        let startIgnoredNote = '';
+        if (conversationOwner !== undefined && conversation_id !== undefined) {
+          const found = conversations.get(conversationOwner, conversation_id);
+          if (found === undefined) {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  'Error: この会話は失効したか、この接続のものではありません。' +
+                  'start_conversation: true で新しい会話を開始し直してください。',
+              }],
+              isError: true,
+            };
+          }
+          history = found;
+          activeConversationId = conversation_id;
+          if (start_conversation === true) {
+            startIgnoredNote = ' start_conversation was ignored — conversation_id was also given.';
+          }
+        } else if (conversationOwner !== undefined && start_conversation === true) {
+          activeConversationId = conversations.create(conversationOwner);
+        }
 
         const route = await routeToModel('chat', model);
 
@@ -2470,6 +2571,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
             structuredOutput: !!responseFormat,
           }),
         });
+        messages.push(...history);
         messages.push({ role: 'user', content: message });
 
         const resp = await chatCompletionStreaming(messages, {
@@ -2485,7 +2587,21 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
 
         const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
         const footer = formatFooter(resp);
-        return { content: [{ type: 'text', text: resp.content + reasoningBlock + footer }] };
+
+        // Only resp.content (the final answer) is retained — never the
+        // reasoning block, footer, or this conversation line itself.
+        let conversationLine = '';
+        if (activeConversationId !== undefined && conversationOwner !== undefined) {
+          conversations.append(conversationOwner, activeConversationId, [
+            { role: 'user', content: message },
+            { role: 'assistant', content: resp.content },
+          ]);
+          const updated = conversations.get(conversationOwner, activeConversationId) ?? [];
+          const chars = updated.reduce((sum, t) => sum + t.content.length, 0);
+          conversationLine = `\n${formatConversationLine(activeConversationId, updated.length, chars, CONVERSATION_TTL_MIN)}${startIgnoredNote}`;
+        }
+
+        return { content: [{ type: 'text', text: resp.content + reasoningBlock + footer + conversationLine }] };
       }
 
       case 'custom_prompt': {
