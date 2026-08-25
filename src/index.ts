@@ -2123,10 +2123,135 @@ const REASONING_PROPS = {
   },
 } as const;
 
-// Only added to chat's inputSchema.properties when CONVERSATIONS_ENABLED (see
-// the conditional spread in TOOLS below). By default this server remembers
-// nothing between calls — these two params opt a single MCP connection into
-// server-side history so the caller stops resending the full transcript.
+// Result of folding a tool call's start_conversation/conversation_id args
+// through resolveConversation() below. 'none' covers both "the caller opted
+// out entirely" and "the caller passed start_conversation: false with no
+// conversation_id" — in both cases there is no active conversation and the
+// caller proceeds exactly as it would with the params omitted.
+type ConversationContext =
+  | { kind: 'none' }
+  | { kind: 'error'; result: CallToolResult }
+  | { kind: 'active'; owner: string; id: string; history: ConversationTurn[]; startIgnoredNote: string };
+
+/**
+ * Resolve a tool call's start_conversation/conversation_id args to a
+ * ConversationContext. This is the multi-tenant safety boundary for
+ * server-side conversations — see conversation-store.ts's header comment
+ * for why owner scoping exists at all — so chat and custom_prompt both
+ * fold their args through this single function rather than each deriving
+ * the owner key and validating the id independently. Two copies of this
+ * logic drifting apart (e.g. one forgetting the "never fall back to a
+ * fixed key over HTTP" rule) would be a cross-tenant history leak, not a
+ * cosmetic bug.
+ */
+function resolveConversation(
+  start_conversation: boolean | undefined,
+  conversation_id: string | undefined,
+  extra: HoutiniExtra,
+): ConversationContext {
+  // Both unspecified → skip every conversation branch below and take the
+  // exact code path these tools already had (default behaviour untouched).
+  const wantsConversation = start_conversation !== undefined || conversation_id !== undefined;
+  if (!wantsConversation) {
+    return { kind: 'none' };
+  }
+
+  if (!CONVERSATIONS_ENABLED) {
+    return {
+      kind: 'error',
+      result: {
+        content: [{ type: 'text', text: 'Error: この houtini-lm インスタンスでは会話保持が無効です。' }],
+        isError: true,
+      },
+    };
+  }
+
+  // Session-ID resolution rule (the multi-tenant safety boundary — see
+  // conversation-store.ts's header comment for why owner scoping exists
+  // at all). HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's
+  // a reliable way to know which resolution applies; never fall back to
+  // a fixed key over HTTP, or two different callers could share history.
+  let conversationOwner: string;
+  if (HOUTINI_LM_TRANSPORT === 'stdio') {
+    conversationOwner = 'stdio-local';
+  } else if (extra.sessionId === undefined) {
+    return {
+      kind: 'error',
+      result: {
+        content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
+        isError: true,
+      },
+    };
+  } else {
+    conversationOwner = extra.sessionId;
+  }
+
+  // conversation_id wins when both are given — start_conversation is
+  // simply ignored, noted on the trailing conversation line by the caller.
+  let history: ConversationTurn[] = [];
+  let activeConversationId: string | undefined;
+  let startIgnoredNote = '';
+  if (conversation_id !== undefined) {
+    const found = conversations.get(conversationOwner, conversation_id);
+    if (found === undefined) {
+      return {
+        kind: 'error',
+        result: {
+          content: [{
+            type: 'text',
+            text:
+              'Error: この会話は失効したか、この接続のものではありません。' +
+              'start_conversation: true で新しい会話を開始し直してください。',
+          }],
+          isError: true,
+        },
+      };
+    }
+    history = found;
+    activeConversationId = conversation_id;
+    if (start_conversation === true) {
+      startIgnoredNote = ' start_conversation was ignored — conversation_id was also given.';
+    }
+  } else if (start_conversation === true) {
+    activeConversationId = conversations.create(conversationOwner);
+  }
+
+  // wantsConversation was true but neither branch above produced an id —
+  // e.g. start_conversation: false with no conversation_id. There's no
+  // active conversation to resolve to; proceed as if nothing was passed.
+  if (activeConversationId === undefined) {
+    return { kind: 'none' };
+  }
+
+  return { kind: 'active', owner: conversationOwner, id: activeConversationId, history, startIgnoredNote };
+}
+
+/**
+ * Append this turn pair (or, for custom_prompt, up to two pairs) to the
+ * active conversation and format the trailing line the response gets
+ * appended with. Returns '' when there's no active conversation — callers
+ * can unconditionally concatenate the result onto their response text.
+ *
+ * Only the turns passed in are retained — never the reasoning block,
+ * footer, or this conversation line itself.
+ */
+function recordConversationTurns(conv: ConversationContext, turns: ConversationTurn[], extraNote?: string): string {
+  if (conv.kind !== 'active') {
+    return '';
+  }
+  conversations.append(conv.owner, conv.id, turns);
+  const updated = conversations.get(conv.owner, conv.id) ?? [];
+  const chars = updated.reduce((sum, t) => sum + t.content.length, 0);
+  return `\n${formatConversationLine(conv.id, updated.length, chars, CONVERSATION_TTL_MIN)}${conv.startIgnoredNote}${extraNote ?? ''}`;
+}
+
+// Added to chat's and custom_prompt's inputSchema.properties when
+// CONVERSATIONS_ENABLED (see the conditional spreads in TOOLS below). By
+// default this server remembers nothing between calls — these two params
+// opt a single MCP connection into server-side history so the caller stops
+// resending the full transcript. The wording below is tool-neutral ("new
+// input") rather than naming chat's `message` param specifically, since
+// custom_prompt shares this object and calls its equivalent `instruction`.
 const CONVERSATION_PROPS = {
   start_conversation: {
     type: 'boolean',
@@ -2134,17 +2259,29 @@ const CONVERSATION_PROPS = {
       'By default this server remembers nothing between calls — every call is stateless unless you opt in here. ' +
       'Set true to start a new server-side conversation — the id is returned on the last line of the response. ' +
       'On every following call in this conversation, pass that id as conversation_id and send ONLY the new ' +
-      'message; do not resend prior turns, the server already has them. If the id expires (idle timeout) or ' +
-      'stops working, start a new conversation rather than retrying the old id.',
+      'input (the new message for chat, the new instruction for custom_prompt); do not resend prior turns, the ' +
+      'server already has them. If the id expires (idle timeout) or stops working, start a new conversation ' +
+      'rather than retrying the old id.',
   },
   conversation_id: {
     type: 'string',
     description:
-      'Continue a conversation previously started with start_conversation: true. Send ONLY the new message — ' +
-      'the server prepends the stored history automatically. If both start_conversation and conversation_id are ' +
-      'given, conversation_id wins and start_conversation is ignored.',
+      'Continue a conversation previously started with start_conversation: true. Send ONLY the new input (the ' +
+      'new message for chat, the new instruction for custom_prompt) — the server prepends the stored history ' +
+      'automatically. If both start_conversation and conversation_id are given, conversation_id wins and ' +
+      "start_conversation is ignored. For custom_prompt, context is recorded in this history only the first " +
+      'time it is sent for a given conversation — resending the identical context on a later call does not ' +
+      'duplicate it.',
   },
 } as const;
+
+// custom_prompt's context/ack exchange (see the multi-turn comment at its
+// call site below) as shared constants, so the string that gets recorded
+// into conversation history and the string checked for "was this context
+// already recorded" are guaranteed to be the exact same literal.
+const CUSTOM_PROMPT_CONTEXT_PREFIX = 'Here is the context for analysis:\n\n';
+const CUSTOM_PROMPT_CONTEXT_ACK =
+  'Understood. I have read the full context. What would you like me to do with it?';
 
 const TOOLS: Tool[] = [
   {
@@ -2216,6 +2353,11 @@ const TOOLS: Tool[] = [
       '• system: persona + constraints, under 30 words. "Expert Python developer focused on performance and correctness."\n' +
       '• context: COMPLETE data — full source, full logs, full text. Never truncate.\n' +
       '• instruction: exactly what to produce, under 50 words. Specify format: "Return a JSON array of {line, issue, fix}."\n\n' +
+      'When continuing a server-side conversation (conversation_id set), it is safe to resend the same context on ' +
+      'every call — the server recognises it and will not duplicate it in the stored history. Omitting it after ' +
+      'the first call also works as long as it is still within the retained history, but resending is the more ' +
+      'robust habit: long conversations trim their oldest turns, and a dropped context is automatically re-added ' +
+      'the next time you send it.\n\n' +
       'Review the output before acting on it — local model capability varies.',
     inputSchema: {
       type: 'object' as const,
@@ -2248,6 +2390,7 @@ const TOOLS: Tool[] = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...(CONVERSATIONS_ENABLED ? CONVERSATION_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
@@ -2500,62 +2643,9 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           conversation_id?: string;
         };
 
-        // Both unspecified → skip every conversation branch below and take the
-        // exact code path this tool already had (default behaviour untouched).
-        const wantsConversation = start_conversation !== undefined || conversation_id !== undefined;
-
-        if (wantsConversation && !CONVERSATIONS_ENABLED) {
-          return {
-            content: [{ type: 'text', text: 'Error: この houtini-lm インスタンスでは会話保持が無効です。' }],
-            isError: true,
-          };
-        }
-
-        // Session-ID resolution rule (the multi-tenant safety boundary — see
-        // conversation-store.ts's header comment for why owner scoping exists
-        // at all). HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's
-        // a reliable way to know which resolution applies; never fall back to
-        // a fixed key over HTTP, or two different callers could share history.
-        let conversationOwner: string | undefined;
-        if (wantsConversation) {
-          if (HOUTINI_LM_TRANSPORT === 'stdio') {
-            conversationOwner = 'stdio-local';
-          } else if (extra.sessionId === undefined) {
-            return {
-              content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
-              isError: true,
-            };
-          } else {
-            conversationOwner = extra.sessionId;
-          }
-        }
-
-        // conversation_id wins when both are given — start_conversation is
-        // simply ignored, noted on the trailing conversation line below.
-        let history: ConversationTurn[] = [];
-        let activeConversationId: string | undefined;
-        let startIgnoredNote = '';
-        if (conversationOwner !== undefined && conversation_id !== undefined) {
-          const found = conversations.get(conversationOwner, conversation_id);
-          if (found === undefined) {
-            return {
-              content: [{
-                type: 'text',
-                text:
-                  'Error: この会話は失効したか、この接続のものではありません。' +
-                  'start_conversation: true で新しい会話を開始し直してください。',
-              }],
-              isError: true,
-            };
-          }
-          history = found;
-          activeConversationId = conversation_id;
-          if (start_conversation === true) {
-            startIgnoredNote = ' start_conversation was ignored — conversation_id was also given.';
-          }
-        } else if (conversationOwner !== undefined && start_conversation === true) {
-          activeConversationId = conversations.create(conversationOwner);
-        }
+        const conv = resolveConversation(start_conversation, conversation_id, extra);
+        if (conv.kind === 'error') return conv.result;
+        const history: ConversationTurn[] = conv.kind === 'active' ? conv.history : [];
 
         const route = await routeToModel('chat', model);
 
@@ -2588,24 +2678,16 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
         const footer = formatFooter(resp);
 
-        // Only resp.content (the final answer) is retained — never the
-        // reasoning block, footer, or this conversation line itself.
-        let conversationLine = '';
-        if (activeConversationId !== undefined && conversationOwner !== undefined) {
-          conversations.append(conversationOwner, activeConversationId, [
-            { role: 'user', content: message },
-            { role: 'assistant', content: resp.content },
-          ]);
-          const updated = conversations.get(conversationOwner, activeConversationId) ?? [];
-          const chars = updated.reduce((sum, t) => sum + t.content.length, 0);
-          conversationLine = `\n${formatConversationLine(activeConversationId, updated.length, chars, CONVERSATION_TTL_MIN)}${startIgnoredNote}`;
-        }
+        const conversationLine = recordConversationTurns(conv, [
+          { role: 'user', content: message },
+          { role: 'assistant', content: resp.content },
+        ]);
 
         return { content: [{ type: 'text', text: resp.content + reasoningBlock + footer + conversationLine }] };
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id } = args as {
           system?: string;
           context?: string;
           instruction: string;
@@ -2615,7 +2697,13 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           model?: string;
           include_reasoning?: boolean;
           force_thinking?: boolean;
+          start_conversation?: boolean;
+          conversation_id?: string;
         };
+
+        const conv = resolveConversation(start_conversation, conversation_id, extra);
+        if (conv.kind === 'error') return conv.result;
+        const history: ConversationTurn[] = conv.kind === 'active' ? conv.history : [];
 
         const route = await routeToModel('analysis', model);
 
@@ -2631,13 +2719,27 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
             structuredOutput: !!responseFormat,
           }),
         });
+        messages.push(...history);
 
         // Multi-turn format prevents context bleed in smaller models.
         // Context goes in a separate user→assistant exchange so the model
-        // "acknowledges" it before receiving the actual instruction.
-        if (context) {
-          messages.push({ role: 'user', content: `Here is the context for analysis:\n\n${context}` });
-          messages.push({ role: 'assistant', content: 'Understood. I have read the full context. What would you like me to do with it?' });
+        // "acknowledges" it before receiving the actual instruction. When a
+        // conversation is active, this pair is recorded into history (see
+        // below) the first time it is sent; on later calls in the same
+        // conversation, resending the identical context is matched by
+        // exact string equality against CUSTOM_PROMPT_CONTEXT_PREFIX +
+        // context (whitespace differences are NOT normalised — a
+        // byte-for-byte match is required) and skipped rather than
+        // duplicated into the prompt or the stored history. If the pair
+        // later falls out of history (ConversationStore.trim() evicts the
+        // oldest turns first), this check goes false again and the pair is
+        // transparently re-added — no action needed from the caller.
+        const contextTurn = context ? `${CUSTOM_PROMPT_CONTEXT_PREFIX}${context}` : undefined;
+        const contextAlreadyInHistory =
+          contextTurn !== undefined && history.some((t) => t.role === 'user' && t.content === contextTurn);
+        if (contextTurn !== undefined && !contextAlreadyInHistory) {
+          messages.push({ role: 'user', content: contextTurn });
+          messages.push({ role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK });
         }
         messages.push({ role: 'user', content: instruction });
 
@@ -2654,8 +2756,30 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
 
         const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
         const footer = formatFooter(resp);
+
+        // Mirror what was actually sent to the model: the context/ack pair
+        // is only stored when it was newly injected above, so a
+        // conversation's history never accumulates duplicate copies of the
+        // same context. The instruction/response pair is always stored.
+        const turnsToStore: ConversationTurn[] =
+          contextTurn !== undefined && !contextAlreadyInHistory
+            ? [
+                { role: 'user', content: contextTurn },
+                { role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK },
+                { role: 'user', content: instruction },
+                { role: 'assistant', content: resp.content },
+              ]
+            : [
+                { role: 'user', content: instruction },
+                { role: 'assistant', content: resp.content },
+              ];
+        const contextNote = contextAlreadyInHistory
+          ? ' context was already recorded for this conversation and was not resent to the model.'
+          : undefined;
+        const conversationLine = recordConversationTurns(conv, turnsToStore, contextNote);
+
         return {
-          content: [{ type: 'text', text: resp.content + reasoningBlock + footer }],
+          content: [{ type: 'text', text: resp.content + reasoningBlock + footer + conversationLine }],
         };
       }
 

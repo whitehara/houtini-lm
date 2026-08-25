@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * End-to-end test for server-side conversation history (phase 9, phase 2:
- * chat wiring). Spawns dist/index.js with HOUTINI_LM_TRANSPORT=http against
- * fake-openai-backend.mjs and drives it over real HTTP — the same transport
- * mechanics as test-http-transport.mjs (session establishment is imported
- * from http-test-helpers.mjs, not re-derived here).
+ * End-to-end test for server-side conversation history (phase 9, phases
+ * 2/3: chat and custom_prompt wiring). Spawns dist/index.js with
+ * HOUTINI_LM_TRANSPORT=http against fake-openai-backend.mjs and drives it
+ * over real HTTP — the same transport mechanics as test-http-transport.mjs
+ * (session establishment is imported from http-test-helpers.mjs, not
+ * re-derived here).
  *
  * Output format matches phase 1's scripts/test-conversation-store.mjs:
  * `PASS  <name>` / `FAIL  <name>`, no colon, two spaces.
@@ -23,14 +24,30 @@ function ok(name, cond, detail) {
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-/** Calls the `chat` tool over an established MCP HTTP session and returns its response text. */
-async function callChat(baseUrl, sessionId, args, id) {
+/** Calls any delegation tool over an established MCP HTTP session and returns its response. */
+async function callTool(baseUrl, sessionId, toolName, args, id) {
   const res = await post(baseUrl, '/mcp', {
     jsonrpc: '2.0', id, method: 'tools/call',
-    params: { name: 'chat', arguments: args },
+    params: { name: toolName, arguments: args },
   }, sessionId);
   const result = res.messages.find((m) => m.id === id)?.result;
   return { httpStatus: res.status, result };
+}
+
+/** Calls the `chat` tool. Thin wrapper over callTool() so the existing phase-2 assertions are untouched. */
+async function callChat(baseUrl, sessionId, args, id) {
+  return callTool(baseUrl, sessionId, 'chat', args, id);
+}
+
+/** Calls the `custom_prompt` tool. */
+async function callCustomPrompt(baseUrl, sessionId, args, id) {
+  return callTool(baseUrl, sessionId, 'custom_prompt', args, id);
+}
+
+/** Fetches tools/list and returns its result (the { tools: [...] } payload). */
+async function toolsList(baseUrl, sessionId, id) {
+  const res = await post(baseUrl, '/mcp', { jsonrpc: '2.0', id, method: 'tools/list', params: {} }, sessionId);
+  return res.messages.find((m) => m.id === id)?.result;
 }
 
 function textOf(result) {
@@ -105,11 +122,177 @@ async function main() {
       ok('nonexistent conversation_id: no request reached the backend', backend.requests.length === 0, String(backend.requests.length));
     }
 
+    console.log('\n=== custom_prompt Conversation E2E Tests (phase 9, phase 3) ===\n');
+
+    // --- no params + context: backend sees 4 messages (system/context-user/ack-assistant/instruction-user), no conversation line ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result } = await callCustomPrompt(baseUrl, sessionId, { context: 'file contents here', instruction: 'summarize', max_tokens: 64 }, 2);
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      ok('custom_prompt no params + context: backend received exactly 4 messages', sent.length === 4, JSON.stringify(sent));
+      ok('custom_prompt no params + context: response has no conversation line', !UUID_RE.test(textOf(result)) && !textOf(result).includes('Conversation'),
+        textOf(result));
+    }
+
+    // --- no params, no context: backend sees 2 messages ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      await callCustomPrompt(baseUrl, sessionId, { instruction: 'summarize', max_tokens: 64 }, 2);
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      ok('custom_prompt no params, no context: backend received exactly 2 messages', sent.length === 2, JSON.stringify(sent));
+    }
+
+    // --- start_conversation: true + context: response has a UUID id, backend still sees 4 messages ---
+    let cpConversationId;
+    let cpSessionId;
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      cpSessionId = sessionId;
+      backend.reset();
+      const { result } = await callCustomPrompt(baseUrl, sessionId,
+        { context: 'file contents here', instruction: 'summarize', max_tokens: 64, start_conversation: true }, 2);
+      const text = textOf(result);
+      const match = text.match(UUID_RE);
+      ok('custom_prompt start_conversation: response contains a UUID-shaped conversation id', !!match, text);
+      cpConversationId = match?.[0];
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      ok('custom_prompt start_conversation + context: backend received exactly 4 messages', sent.length === 4, JSON.stringify(sent));
+    }
+
+    // --- continuation with the identical context string: it must appear exactly once in the request ---
+    {
+      backend.reset();
+      const contextText = 'file contents here';
+      const { result } = await callCustomPrompt(baseUrl, cpSessionId,
+        { context: contextText, instruction: 'refine', max_tokens: 64, conversation_id: cpConversationId }, 3);
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      const occurrences = sent.filter((m) => typeof m.content === 'string' && m.content.includes(contextText)).length;
+      ok('custom_prompt continuation with identical context: context string appears exactly once', occurrences === 1, JSON.stringify(sent));
+      ok('custom_prompt continuation with identical context: HTTP call succeeded', result && result.isError !== true, JSON.stringify(result));
+    }
+
+    // --- continuation with a *different* context string: old and new each appear exactly once ---
+    {
+      backend.reset();
+      const newContextText = 'updated file contents';
+      await callCustomPrompt(baseUrl, cpSessionId,
+        { context: newContextText, instruction: 'refine again', max_tokens: 64, conversation_id: cpConversationId }, 4);
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      const oldOccurrences = sent.filter((m) => typeof m.content === 'string' && m.content.includes('file contents here')).length;
+      const newOccurrences = sent.filter((m) => typeof m.content === 'string' && m.content.includes(newContextText)).length;
+      ok('custom_prompt continuation with different context: old context string appears exactly once', oldOccurrences === 1, JSON.stringify(sent));
+      ok('custom_prompt continuation with different context: new context string appears exactly once', newOccurrences === 1, JSON.stringify(sent));
+    }
+
+    // --- continuation with context omitted: the original context is still present exactly once, via history ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const contextText = 'omit-context-test file contents';
+      const { result: firstResult } = await callCustomPrompt(baseUrl, sessionId,
+        { context: contextText, instruction: 'first', max_tokens: 64, start_conversation: true }, 2);
+      const id = textOf(firstResult).match(UUID_RE)?.[0];
+      backend.reset();
+      await callCustomPrompt(baseUrl, sessionId, { instruction: 'second, no context this time', max_tokens: 64, conversation_id: id }, 3);
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      const occurrences = sent.filter((m) => typeof m.content === 'string' && m.content.includes(contextText)).length;
+      ok('custom_prompt continuation with context omitted: original context still appears exactly once via history', occurrences === 1,
+        JSON.stringify(sent));
+      ok('custom_prompt continuation with context omitted: instruction is the last message', sent.at(-1)?.content === 'second, no context this time',
+        JSON.stringify(sent.at(-1)));
+    }
+
+    // --- cross-tool continuation: a conversation started by chat can be continued by custom_prompt ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result: chatResult } = await callChat(baseUrl, sessionId, { message: 'chat first turn', max_tokens: 64, start_conversation: true }, 2);
+      const id = textOf(chatResult).match(UUID_RE)?.[0];
+      backend.reset();
+      const { result: cpResult } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'continue via custom_prompt', max_tokens: 64, conversation_id: id }, 3);
+      ok('cross-tool continuation: custom_prompt can continue a conversation started by chat', cpResult && cpResult.isError !== true, JSON.stringify(cpResult));
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      const containsFirstTurn = sent.some((m) => typeof m.content === 'string' && m.content.includes('chat first turn'));
+      ok('cross-tool continuation: backend request includes chat\'s first turn content', containsFirstTurn, JSON.stringify(sent));
+    }
+
+    // --- cross-session access via custom_prompt: another session's conversation_id must not be usable ---
+    {
+      const { sessionId: sessionIdB } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result } = await callCustomPrompt(baseUrl, sessionIdB, { instruction: 'intruding via custom_prompt', max_tokens: 64, conversation_id: cpConversationId }, 2);
+      ok('custom_prompt cross-session: accessing another session\'s conversation_id is isError', result?.isError === true, JSON.stringify(result));
+      const text = textOf(result);
+      ok('custom_prompt cross-session: response contains no conversation content', !text.includes('file contents here') && !text.includes('fake.'), text);
+      ok('custom_prompt cross-session: no request reached the backend', backend.requests.length === 0, String(backend.requests.length));
+    }
+
+    // --- nonexistent conversation_id via custom_prompt: isError, no backend request ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'hi', max_tokens: 64, conversation_id: '00000000-0000-0000-0000-000000000000' }, 2);
+      ok('custom_prompt nonexistent conversation_id: isError', result?.isError === true, JSON.stringify(result));
+      ok('custom_prompt nonexistent conversation_id: no request reached the backend', backend.requests.length === 0, String(backend.requests.length));
+    }
+
+    // --- tools/list exposes the conversation params on custom_prompt too ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const list = await toolsList(baseUrl, sessionId, 99);
+      const customPrompt = (list?.tools ?? []).find((t) => t.name === 'custom_prompt');
+      const props = customPrompt?.inputSchema?.properties ?? {};
+      ok('tools/list: custom_prompt.inputSchema.properties has start_conversation', 'start_conversation' in props, JSON.stringify(Object.keys(props)));
+      ok('tools/list: custom_prompt.inputSchema.properties has conversation_id', 'conversation_id' in props, JSON.stringify(Object.keys(props)));
+    }
+
     console.log(failed ? `\n${failed} FAILED\n` : '\nAll conversation e2e tests passed\n');
   } finally {
     child.kill();
     await backend.close();
   }
+
+  // === HOUTINI_LM_CONVERSATIONS=off tests: a second server instance with the feature disabled ===
+  console.log('\n=== HOUTINI_LM_CONVERSATIONS=off E2E Tests ===\n');
+  const backend2 = await startFakeBackend();
+  const port2 = await getFreePort();
+  const { child: child2, ready: ready2 } = startServer(backend2.url, port2, { HOUTINI_LM_CONVERSATIONS: '0' });
+  const baseUrl2 = `http://127.0.0.1:${port2}`;
+  try {
+    await ready2;
+    const { sessionId } = await initializeSession(baseUrl2, '/mcp');
+
+    const list = await toolsList(baseUrl2, sessionId, 2);
+    const chatProps = (list?.tools ?? []).find((t) => t.name === 'chat')?.inputSchema?.properties ?? {};
+    const cpProps = (list?.tools ?? []).find((t) => t.name === 'custom_prompt')?.inputSchema?.properties ?? {};
+    ok('off: chat.inputSchema.properties has no conversation params',
+      !('start_conversation' in chatProps) && !('conversation_id' in chatProps), JSON.stringify(Object.keys(chatProps)));
+    ok('off: custom_prompt.inputSchema.properties has no conversation params',
+      !('start_conversation' in cpProps) && !('conversation_id' in cpProps), JSON.stringify(Object.keys(cpProps)));
+
+    backend2.reset();
+    const { result: chatOffResult } = await callChat(baseUrl2, sessionId, { message: 'hi', max_tokens: 64, start_conversation: true }, 3);
+    ok('off: chat with start_conversation:true is isError', chatOffResult?.isError === true, JSON.stringify(chatOffResult));
+
+    backend2.reset();
+    const { result: cpOffResult } = await callCustomPrompt(baseUrl2, sessionId, { instruction: 'hi', max_tokens: 64, start_conversation: true }, 4);
+    ok('off: custom_prompt with start_conversation:true is isError', cpOffResult?.isError === true, JSON.stringify(cpOffResult));
+
+    backend2.reset();
+    const { result: cpNormalResult } = await callCustomPrompt(baseUrl2, sessionId, { instruction: 'hi', max_tokens: 64 }, 5);
+    const sent = backend2.requests.at(-1)?.messages ?? [];
+    ok('off: custom_prompt without conversation params succeeds normally, backend receives 2 messages', sent.length === 2, JSON.stringify(sent));
+    ok('off: custom_prompt response has no conversation line', !UUID_RE.test(textOf(cpNormalResult)) && !textOf(cpNormalResult).includes('Conversation'),
+      textOf(cpNormalResult));
+
+    console.log(failed ? `\n${failed} FAILED\n` : '\nAll disabled-mode e2e tests passed\n');
+  } finally {
+    child2.kill();
+    await backend2.close();
+  }
+
   process.exitCode = failed ? 1 : 0;
 }
 
