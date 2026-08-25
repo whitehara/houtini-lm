@@ -36,6 +36,11 @@ services:
     environment:
       - HOUTINI_LM_TRANSPORT=http
       - HOUTINI_LM_HTTP_PORT=3000
+      # mcp-auth-proxy's URL-backend mode assumes the backend serves MCP at
+      # its root path (matching this homelab's other MCP services); it does
+      # not correctly resolve OAuth protected-resource metadata or token
+      # resource/audience for a non-root backend path.
+      - HOUTINI_LM_HTTP_PATH=/
       - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://ollama.com}
       - HOUTINI_LM_API_KEY=${HOUTINI_LM_API_KEY:-}
       - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/home/node/.houtini-lm/no-files}
@@ -78,7 +83,7 @@ services:
       - "--oidc-provider-name=Cloudflare Access"
       - "--oidc-allowed-users-glob=${OIDC_ALLOWED_USERS_GLOB:-}"
       - "--"
-      - "http://houtini-lm:3000/mcp"
+      - "http://houtini-lm:3000"
     volumes:
       - houtini-lm_auth_data:/data
     networks:
