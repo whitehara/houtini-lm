@@ -138,6 +138,10 @@ Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` 
 
 **This server does not authenticate HTTP requests.** Don't expose it directly to the internet — put an authenticating reverse proxy (e.g. [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy)) in front of it, and keep the container itself reachable only from that proxy.
 
+#### Docker Swarm
+
+`compose.swarm.yml` in this repo deploys houtini-lm alongside [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy) as a sidecar in front of it, terminating OIDC authentication before traffic reaches the MCP server — mcp-auth-proxy is pointed at the HTTP transport's `/mcp` endpoint via its `--` positional backend argument, not an environment variable. Deploy it as its own stack; the file expects deployment-specific values (public hostname, backend endpoint/API key, OIDC client credentials) to be supplied as stack environment variables rather than edited into the compose file itself — see the variable list in the file's header comment.
+
 ### LLM on a different machine
 
 I've got a GPU box on my local network running Qwen 3 Coder Next in LM Studio. If you've got a similar setup, point the URL at it:

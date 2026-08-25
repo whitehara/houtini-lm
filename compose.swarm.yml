@@ -1,0 +1,108 @@
+# Docker Swarm deployment: houtini-lm + mcp-auth-proxy (OIDC-authenticated sidecar).
+# Deploy as a standalone stack (e.g. `houtini_lm_stack`) via Portainer.
+#
+# Environment variables referenced below (set as stack env vars in Portainer,
+# never committed here):
+# HOUTINI_LM_IMAGE_TAG      — GHCR image tag to deploy (optional, default: latest)
+# HOUTINI_LM_PUBLIC_HOST    — public hostname this stack is reached at (required)
+# HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://ollama.com)
+# HOUTINI_LM_API_KEY        — backend API key, e.g. Ollama Cloud key (required, secret)
+# HOUTINI_LM_FILE_ROOTS     — code_task_files allow-list; point at a non-existent path to seal it off remotely (optional, default: sealed)
+# HOUTINI_LM_SERIALISE      — serialise concurrent inference calls, 0/1 (optional, default: 0 — no benefit against a cloud backend)
+# HOUTINI_LM_CROSS_PROCESS_LOCK — cross-process inference lock, 0/1 (optional, default: 0)
+# OIDC_CLIENT_ID            — OIDC client id for mcp-auth-proxy (required, secret)
+# OIDC_CLIENT_SECRET        — OIDC client secret for mcp-auth-proxy (required, secret)
+# OIDC_CONFIGURATION_URL    — OIDC discovery document URL (required, secret)
+# OIDC_ALLOWED_USERS_GLOB   — glob restricting which authenticated users may connect (optional, default: unrestricted)
+# NFS_SERVER_ADDR           — hostname/IP of the NFS server backing houtini-lm_auth_data (required, homelab-specific)
+
+volumes:
+  houtini-lm-state:
+  houtini-lm_auth_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER_ADDR},hard,nfsvers=4.2,nconnect=4,noresvport"
+      device: ":/docker-volumes/houtini-lm_auth_data"
+
+networks:
+  internal-net:
+  traefik_stack_public_net:
+    external: true
+
+services:
+  houtini-lm:
+    image: ghcr.io/whitehara/houtini-lm:${HOUTINI_LM_IMAGE_TAG:-latest}
+    environment:
+      - HOUTINI_LM_TRANSPORT=http
+      - HOUTINI_LM_HTTP_PORT=3000
+      - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://ollama.com}
+      - HOUTINI_LM_API_KEY=${HOUTINI_LM_API_KEY:-}
+      - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/home/node/.houtini-lm/no-files}
+      - HOUTINI_LM_SERIALISE=${HOUTINI_LM_SERIALISE:-0}
+      - HOUTINI_LM_CROSS_PROCESS_LOCK=${HOUTINI_LM_CROSS_PROCESS_LOCK:-0}
+    volumes:
+      - houtini-lm-state:/home/node/.houtini-lm
+    networks:
+      - internal-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+      labels:
+        - traefik.enable=false
+
+  mcp-auth-proxy:
+    image: ghcr.io/sigbit/mcp-auth-proxy:latest
+    command:
+      - "--external-url=https://${HOUTINI_LM_PUBLIC_HOST}"
+      - "--no-auto-tls"
+      - "--listen=:80"
+      - "--trusted-proxies=0.0.0.0/0"
+      - "--data-path=/data"
+      - "--oidc-client-id=${OIDC_CLIENT_ID}"
+      - "--oidc-client-secret=${OIDC_CLIENT_SECRET}"
+      - "--oidc-configuration-url=${OIDC_CONFIGURATION_URL}"
+      - "--oidc-provider-name=Cloudflare Access"
+      - "--oidc-allowed-users-glob=${OIDC_ALLOWED_USERS_GLOB:-}"
+      - "--"
+      - "http://houtini-lm:3000/mcp"
+    volumes:
+      - houtini-lm_auth_data:/data
+    networks:
+      - internal-net
+      - traefik_stack_public_net
+    depends_on:
+      - houtini-lm
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+      labels:
+        - tunnel-sync.enable=true
+        - traefik.enable=true
+        - traefik.docker.network=traefik_stack_public_net
+        - traefik.http.routers.houtini-lm.rule=Host(`${HOUTINI_LM_PUBLIC_HOST}`)
+        - traefik.http.routers.houtini-lm.entrypoints=http
+        - traefik.http.routers.houtini-lm.service=houtini-lm-service
+        - traefik.http.routers.houtini-lm.middlewares=houtini-lm-cors
+        - traefik.http.services.houtini-lm-service.loadbalancer.server.port=80
+        - traefik.http.middlewares.houtini-lm-cors.headers.accesscontrolalloworiginlist=https://dash.cloudflare.com
+        - traefik.http.middlewares.houtini-lm-cors.headers.accesscontrolallowmethods=GET,POST,OPTIONS,DELETE
+        - traefik.http.middlewares.houtini-lm-cors.headers.accesscontrolallowheaders=Authorization,Content-Type,Accept,Mcp-Session-Id,Mcp-Protocol-Version
+        - traefik.http.middlewares.houtini-lm-cors.headers.accesscontrolexposeheaders=Mcp-Session-Id
+        - traefik.http.middlewares.houtini-lm-cors.headers.accesscontrolmaxage=600
+        - traefik.http.middlewares.houtini-lm-cors.headers.addvaryheader=true
