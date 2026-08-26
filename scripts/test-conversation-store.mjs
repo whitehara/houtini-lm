@@ -1,7 +1,7 @@
 // Unit test for ConversationStore + formatConversationLine (phase 9:
 // server-side conversations). Pure logic, no backend needed.
 // Run: npm run test:conversations
-import { ConversationStore, formatConversationLine } from '../dist/conversation-store.js';
+import { ConversationStore, formatConversationLine, formatConversationList } from '../dist/conversation-store.js';
 
 let failed = 0;
 const eq = (name, got, want) => {
@@ -251,6 +251,28 @@ function makeClock(start) {
   ok('formatConversationLine mentions the turn count', line.includes('3'));
   ok('formatConversationLine mentions the char count', line.includes('120'));
   ok('formatConversationLine mentions the TTL', line.includes('60'));
+}
+
+// --- formatConversationList: the `conversations` tool's `list` action rendering (phase 9, phase 4) ---
+{
+  const emptyOutput = formatConversationList([], 60, 1_000_000);
+  ok('formatConversationList on empty input mentions no active conversations', emptyOutput.includes('No active conversations'));
+  ok('formatConversationList on empty input has no table pipe characters', !emptyOutput.includes('|'));
+
+  const now = 1_000_000;
+  const older = { id: 'older-id', turns: 2, chars: 40, createdAt: now - 500_000, lastUsedAt: now - 400_000 };
+  const newer = { id: 'newer-id', turns: 4, chars: 200, createdAt: now - 100_000, lastUsedAt: now - 10_000 };
+  const twoOutput = formatConversationList([older, newer], 60, now);
+  ok('formatConversationList includes both conversation ids', twoOutput.includes('older-id') && twoOutput.includes('newer-id'));
+  ok('formatConversationList sorts most-recently-used first', twoOutput.indexOf('newer-id') < twoOutput.indexOf('older-id'));
+  ok('formatConversationList includes turn and char counts', twoOutput.includes('4') && twoOutput.includes('200'));
+  ok('formatConversationList has no leading or trailing newline', !twoOutput.startsWith('\n') && !twoOutput.endsWith('\n'));
+
+  // idle time exceeds the TTL window entirely — expires-in must clamp to "<1m",
+  // never show a negative or over-TTL value.
+  const expiredButNotYetSwept = { id: 'stale-id', turns: 1, chars: 10, createdAt: now - 10_000_000, lastUsedAt: now - 10_000_000 };
+  const staleOutput = formatConversationList([expiredButNotYetSwept], 60, now);
+  ok('formatConversationList clamps an over-TTL idle time to <1m expires-in, not a negative number', staleOutput.includes('<1m') && !/-\d+m/.test(staleOutput));
 }
 
 process.stdout.write(failed ? `\n${failed} FAILED\n` : '\nAll conversation-store tests passed\n');

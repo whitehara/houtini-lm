@@ -249,3 +249,38 @@ export class ConversationStore {
 export function formatConversationLine(id: string, turns: number, chars: number, ttlMin: number): string {
   return `💬 Conversation ${id} — ${turns} turn${turns === 1 ? '' : 's'}, ${chars} chars retained. Idle-expires in ${ttlMin}min. Continue with conversation_id: "${id}".`;
 }
+
+/** Render a duration in minutes the way the `conversations` tool's list table does — floor to whole minutes, `<1m` below one. */
+function formatMinutes(minutes: number): string {
+  const floored = Math.floor(minutes);
+  return floored < 1 ? '<1m' : `${floored}m`;
+}
+
+/**
+ * Build the markdown output for the `conversations` tool's `list` action.
+ * Takes only `ConversationSummary` — which has no message-content field —
+ * so returning the caller's own message bodies here isn't a possible bug to
+ * introduce later, it's structurally unavailable. That's the point: `list`
+ * exists to let a caller rediscover which conversation ids it still holds,
+ * not to replay history outside the chat/custom_prompt flow that's meant to
+ * consume it.
+ */
+export function formatConversationList(summaries: ConversationSummary[], ttlMin: number, now: number): string {
+  if (summaries.length === 0) {
+    return 'No active conversations on this connection. Start one by calling chat or custom_prompt with start_conversation: true.';
+  }
+
+  const sorted = [...summaries].sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+
+  const lines: string[] = [];
+  lines.push('| conversation_id | turns | chars | idle | expires in |');
+  lines.push('|---|---:|---:|---|---|');
+  for (const s of sorted) {
+    const idleMin = (now - s.lastUsedAt) / 60_000;
+    const expiresMin = ttlMin - idleMin;
+    lines.push(`| ${s.id} | ${s.turns} | ${s.chars} | ${formatMinutes(idleMin)} | ${formatMinutes(Math.max(0, expiresMin))} |`);
+  }
+  lines.push('*Only conversations owned by this MCP connection are listed. Listing does not refresh idle timers.*');
+
+  return lines.join('\n');
+}

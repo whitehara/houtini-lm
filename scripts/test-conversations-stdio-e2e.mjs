@@ -91,6 +91,19 @@ async function main() {
     ok('stdio: nonexistent conversation_id is isError', missing.result?.isError === true, JSON.stringify(missing.result));
     ok('stdio: nonexistent conversation_id backend received no request', backend.requests.length === 0, String(backend.requests.length));
 
+    // --- 9/10: the `conversations` tool works over the fixed stdio owner key and never returns message bodies ---
+    const list = await callTool('conversations', { action: 'list' });
+    const listText = textOf(list.result);
+    ok('stdio: conversations list is not a "needs an MCP session" error', list.result?.isError !== true && !listText.includes('MCPセッションが必要です'), JSON.stringify(list.result));
+    ok('stdio: conversations list includes this owner\'s conversation id', listText.includes(conversationId), listText);
+    ok('stdio: conversations list does not include a message body', !listText.includes('first turn'), listText);
+
+    // --- 11/12: deleting one's own conversation over stdio succeeds and the id stops working ---
+    const deleteResult = await callTool('conversations', { action: 'delete', conversation_id: conversationId });
+    ok('stdio: conversations delete of one\'s own conversation id is not isError', deleteResult.result?.isError !== true, JSON.stringify(deleteResult.result));
+    const continueAfterDelete = await callTool('chat', { message: 'should fail', max_tokens: 64, conversation_id: conversationId });
+    ok('stdio: chat continuation of a deleted conversation id is isError', continueAfterDelete.result?.isError === true, JSON.stringify(continueAfterDelete.result));
+
     console.log(`\n=== Results: ${failed === 0 ? 'all stdio conversation e2e tests passed' : `${failed} FAILED`} ===\n`);
   } finally {
     close();

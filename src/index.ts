@@ -50,7 +50,7 @@ import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
 import { formatReasoningBlock } from './reasoning-block.js';
 import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.js';
-import { ConversationStore, formatConversationLine, type ConversationTurn } from './conversation-store.js';
+import { ConversationStore, formatConversationLine, formatConversationList, type ConversationTurn } from './conversation-store.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -2133,6 +2133,46 @@ type ConversationContext =
   | { kind: 'error'; result: CallToolResult }
   | { kind: 'active'; owner: string; id: string; history: ConversationTurn[]; startIgnoredNote: string };
 
+// Shared verbatim between resolveConversation() below and every other call
+// site that needs to know whether server-side conversations are turned on
+// at all — one literal, so the wording can never drift between them.
+const CONVERSATIONS_DISABLED_MESSAGE = 'Error: この houtini-lm インスタンスでは会話保持が無効です。';
+
+// Result of resolveConversationOwner() below: either the owner key this
+// caller is scoped to, or the isError result to return unchanged because
+// no owner could be resolved (HTTP with no MCP session — see the function
+// for why this never falls back to a shared key).
+type ConversationOwner = { kind: 'owner'; owner: string } | { kind: 'error'; result: CallToolResult };
+
+/**
+ * Resolve the caller's conversation owner key. This is the multi-tenant
+ * safety boundary for server-side conversations — see conversation-store.ts's
+ * header comment for why owner scoping exists at all — so resolveConversation()
+ * (chat/custom_prompt) and the conversations management tool both fold
+ * through this single function rather than each deriving the owner key
+ * independently. Two copies of this logic drifting apart (e.g. one
+ * forgetting the "never fall back to a fixed key over HTTP" rule) would be
+ * a cross-tenant history leak, not a cosmetic bug.
+ */
+function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
+  // HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's a reliable
+  // way to know which resolution applies; never fall back to a fixed key
+  // over HTTP, or two different callers could share history.
+  if (HOUTINI_LM_TRANSPORT === 'stdio') {
+    return { kind: 'owner', owner: 'stdio-local' };
+  }
+  if (extra.sessionId === undefined) {
+    return {
+      kind: 'error',
+      result: {
+        content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
+        isError: true,
+      },
+    };
+  }
+  return { kind: 'owner', owner: extra.sessionId };
+}
+
 /**
  * Resolve a tool call's start_conversation/conversation_id args to a
  * ConversationContext. This is the multi-tenant safety boundary for
@@ -2160,31 +2200,17 @@ function resolveConversation(
     return {
       kind: 'error',
       result: {
-        content: [{ type: 'text', text: 'Error: この houtini-lm インスタンスでは会話保持が無効です。' }],
+        content: [{ type: 'text', text: CONVERSATIONS_DISABLED_MESSAGE }],
         isError: true,
       },
     };
   }
 
-  // Session-ID resolution rule (the multi-tenant safety boundary — see
-  // conversation-store.ts's header comment for why owner scoping exists
-  // at all). HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's
-  // a reliable way to know which resolution applies; never fall back to
-  // a fixed key over HTTP, or two different callers could share history.
-  let conversationOwner: string;
-  if (HOUTINI_LM_TRANSPORT === 'stdio') {
-    conversationOwner = 'stdio-local';
-  } else if (extra.sessionId === undefined) {
-    return {
-      kind: 'error',
-      result: {
-        content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
-        isError: true,
-      },
-    };
-  } else {
-    conversationOwner = extra.sessionId;
+  const ownerResult = resolveConversationOwner(extra);
+  if (ownerResult.kind === 'error') {
+    return { kind: 'error', result: ownerResult.result };
   }
+  const conversationOwner = ownerResult.owner;
 
   // conversation_id wins when both are given — start_conversation is
   // simply ignored, noted on the trailing conversation line by the caller.
@@ -2261,7 +2287,7 @@ const CONVERSATION_PROPS = {
       'On every following call in this conversation, pass that id as conversation_id and send ONLY the new ' +
       'input (the new message for chat, the new instruction for custom_prompt); do not resend prior turns, the ' +
       'server already has them. If the id expires (idle timeout) or stops working, start a new conversation ' +
-      'rather than retrying the old id.',
+      'rather than retrying the old id. Use the conversations tool to list or discard conversations you\'ve started.',
   },
   conversation_id: {
     type: 'string',
@@ -2545,6 +2571,38 @@ const TOOLS: Tool[] = [
       },
     },
   },
+  // Only shown when CONVERSATIONS_ENABLED — mirrors the conditional spread
+  // used for chat's and custom_prompt's CONVERSATION_PROPS above, so a
+  // sealed instance hides this tool entirely rather than exposing it and
+  // erroring on every call.
+  ...(CONVERSATIONS_ENABLED ? [{
+    name: 'conversations',
+    description:
+      'Manage server-side conversations started with chat or custom_prompt\'s start_conversation. Scoped to ' +
+      'this MCP connection only — you can never see or touch another connection\'s conversations, and this ' +
+      'tool never reveals whether one exists. `list` returns metadata only (id, turn count, char count, idle ' +
+      'time, expiry) — never message content. `delete` removes one conversation by conversation_id. `clear` ' +
+      'is destructive: it removes every conversation on this connection at once. There is no confirmation step ' +
+      'for clear — call list first if you need to check what would be lost.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'delete', 'clear'],
+          description:
+            '"list": show this connection\'s conversations (metadata only, no message content). ' +
+            '"delete": remove one conversation — requires conversation_id. ' +
+            '"clear": remove every conversation on this connection.',
+        },
+        conversation_id: {
+          type: 'string',
+          description: 'Required for action: "delete". Ignored for "list" and "clear".',
+        },
+      },
+      required: ['action'],
+    },
+  }] : []),
 ];
 
 // ── MCP Server ───────────────────────────────────────────────────────
@@ -3292,6 +3350,60 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         lines.push(`*Stats persist across restarts in \`~/.houtini-lm/model-cache.db\`.*`);
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      case 'conversations': {
+        if (!CONVERSATIONS_ENABLED) {
+          return {
+            content: [{ type: 'text', text: CONVERSATIONS_DISABLED_MESSAGE }],
+            isError: true,
+          };
+        }
+
+        const { action, conversation_id } = args as { action?: string; conversation_id?: string };
+        if (action !== 'list' && action !== 'delete' && action !== 'clear') {
+          return {
+            content: [{ type: 'text', text: 'Error: action must be one of "list", "delete", "clear".' }],
+            isError: true,
+          };
+        }
+
+        const ownerResult = resolveConversationOwner(extra);
+        if (ownerResult.kind === 'error') return ownerResult.result;
+        const owner = ownerResult.owner;
+
+        // list() runs the store's lazy TTL sweep as a side effect, so calling
+        // it first — for every action, not just "list" — means delete/clear
+        // below always act on conversations that are actually still alive
+        // rather than reporting success for an id the sweep just expired.
+        const summaries = conversations.list(owner);
+
+        if (action === 'list') {
+          return { content: [{ type: 'text', text: formatConversationList(summaries, CONVERSATION_TTL_MIN, Date.now()) }] };
+        }
+
+        if (action === 'delete') {
+          if (conversation_id === undefined) {
+            return {
+              content: [{ type: 'text', text: 'Error: conversation_id is required for action: "delete".' }],
+              isError: true,
+            };
+          }
+          // Same message and isError regardless of whether conversation_id
+          // never existed or belongs to a different owner — distinguishing
+          // the two would let a caller probe for other connections' ids.
+          if (!summaries.some((s) => s.id === conversation_id)) {
+            return {
+              content: [{ type: 'text', text: 'Error: this conversation has expired or does not belong to this connection.' }],
+              isError: true,
+            };
+          }
+          conversations.delete(owner, conversation_id);
+          return { content: [{ type: 'text', text: `Deleted conversation ${conversation_id}.` }] };
+        }
+
+        const cleared = conversations.clear(owner);
+        return { content: [{ type: 'text', text: `Cleared ${cleared} conversation${cleared === 1 ? '' : 's'} on this connection.` }] };
       }
 
       default:

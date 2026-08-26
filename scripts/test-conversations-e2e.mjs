@@ -44,6 +44,11 @@ async function callCustomPrompt(baseUrl, sessionId, args, id) {
   return callTool(baseUrl, sessionId, 'custom_prompt', args, id);
 }
 
+/** Calls the `conversations` management tool (phase 9, phase 4). */
+async function callConversations(baseUrl, sessionId, args, id) {
+  return callTool(baseUrl, sessionId, 'conversations', args, id);
+}
+
 /** Fetches tools/list and returns its result (the { tools: [...] } payload). */
 async function toolsList(baseUrl, sessionId, id) {
   const res = await post(baseUrl, '/mcp', { jsonrpc: '2.0', id, method: 'tools/list', params: {} }, sessionId);
@@ -248,6 +253,105 @@ async function main() {
       ok('tools/list: custom_prompt.inputSchema.properties has conversation_id', 'conversation_id' in props, JSON.stringify(Object.keys(props)));
     }
 
+    // === `conversations` management tool (phase 9, phase 4) ===
+    console.log('\n=== conversations tool E2E Tests (phase 9, phase 4) ===\n');
+
+    // --- fresh session: list is empty, no conversation id leaks in ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const { result } = await callConversations(baseUrl, sessionId, { action: 'list' }, 2);
+      const text = textOf(result);
+      ok('conversations list on a fresh session mentions no active conversations', text.includes('No active conversations'), text);
+      ok('conversations list on a fresh session contains no conversation id', !UUID_RE.test(text), text);
+    }
+
+    // --- two conversations started by this session both appear in list, with no message bodies ---
+    let listSessionId;
+    let listIdA;
+    let listIdB;
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      listSessionId = sessionId;
+      backend.reset();
+      const { result: r1 } = await callChat(baseUrl, sessionId, { message: 'list-test conversation A', max_tokens: 64, start_conversation: true }, 2);
+      listIdA = textOf(r1).match(UUID_RE)?.[0];
+      backend.reset();
+      const { result: r2 } = await callChat(baseUrl, sessionId, { message: 'list-test conversation B', max_tokens: 64, start_conversation: true }, 3);
+      listIdB = textOf(r2).match(UUID_RE)?.[0];
+
+      const { result } = await callConversations(baseUrl, sessionId, { action: 'list' }, 4);
+      const text = textOf(result);
+      ok('conversations list includes both conversation ids started on this session', text.includes(listIdA) && text.includes(listIdB), text);
+      ok('conversations list does not include the assistant reply body', !text.includes('fake.'), text);
+      ok('conversations list does not include the user turn body', !text.includes('list-test conversation A') && !text.includes('list-test conversation B'), text);
+    }
+
+    // --- cross-session isolation: another session's list never shows this session's ids, and delete gives the identical "not found" response ---
+    {
+      const { sessionId: sessionIdB } = await initializeSession(baseUrl, '/mcp');
+      const { result: listResult } = await callConversations(baseUrl, sessionIdB, { action: 'list' }, 2);
+      const listText = textOf(listResult);
+      ok('conversations list from another session does not include this session\'s ids', !listText.includes(listIdA) && !listText.includes(listIdB), listText);
+
+      const { result: crossDeleteResult } = await callConversations(baseUrl, sessionIdB, { action: 'delete', conversation_id: listIdA }, 3);
+      const { result: nonexistentDeleteResult } = await callConversations(baseUrl, sessionIdB, { action: 'delete', conversation_id: '00000000-0000-0000-0000-000000000000' }, 4);
+      ok('conversations delete of another session\'s id is isError', crossDeleteResult?.isError === true, JSON.stringify(crossDeleteResult));
+      ok('conversations delete of another session\'s id gives the exact same response as deleting a nonexistent id (no existence leak)',
+        textOf(crossDeleteResult) === textOf(nonexistentDeleteResult) && crossDeleteResult?.isError === nonexistentDeleteResult?.isError,
+        JSON.stringify({ cross: crossDeleteResult, nonexistent: nonexistentDeleteResult }));
+    }
+
+    // --- deleting one's own conversation: succeeds, the id stops working, and list reflects the removal ---
+    {
+      const { result: deleteResult } = await callConversations(baseUrl, listSessionId, { action: 'delete', conversation_id: listIdA }, 5);
+      ok('conversations delete of one\'s own conversation id is not isError', deleteResult?.isError !== true, JSON.stringify(deleteResult));
+
+      const { result: continueResult } = await callChat(baseUrl, listSessionId, { message: 'should fail', max_tokens: 64, conversation_id: listIdA }, 6);
+      ok('chat continuation of a deleted conversation id is isError', continueResult?.isError === true, JSON.stringify(continueResult));
+
+      const { result: listAfterDelete } = await callConversations(baseUrl, listSessionId, { action: 'list' }, 7);
+      const text = textOf(listAfterDelete);
+      ok('conversations list no longer includes the deleted id', !text.includes(listIdA), text);
+      ok('conversations list still includes the untouched sibling id', text.includes(listIdB), text);
+    }
+
+    // --- parameter validation ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const { result: missingIdResult } = await callConversations(baseUrl, sessionId, { action: 'delete' }, 2);
+      ok('conversations delete without conversation_id is isError', missingIdResult?.isError === true, JSON.stringify(missingIdResult));
+
+      const { result: badActionResult } = await callConversations(baseUrl, sessionId, { action: 'not-a-real-action' }, 3);
+      ok('conversations with an invalid action is isError', badActionResult?.isError === true, JSON.stringify(badActionResult));
+    }
+
+    // --- clear: wipes every conversation owned by this session, and previously-valid ids stop working ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result: startResult } = await callChat(baseUrl, sessionId, { message: 'clear-test conversation', max_tokens: 64, start_conversation: true }, 2);
+      const clearId = textOf(startResult).match(UUID_RE)?.[0];
+
+      const { result: clearResult } = await callConversations(baseUrl, sessionId, { action: 'clear' }, 3);
+      const clearText = textOf(clearResult);
+      ok('conversations clear response mentions a count', /\d+/.test(clearText), clearText);
+      ok('conversations clear is not isError', clearResult?.isError !== true, JSON.stringify(clearResult));
+
+      const { result: listAfterClear } = await callConversations(baseUrl, sessionId, { action: 'list' }, 4);
+      ok('conversations list is empty after clear', textOf(listAfterClear).includes('No active conversations'), textOf(listAfterClear));
+
+      const { result: continueAfterClear } = await callChat(baseUrl, sessionId, { message: 'should fail after clear', max_tokens: 64, conversation_id: clearId }, 5);
+      ok('chat continuation of a cleared conversation id is isError', continueAfterClear?.isError === true, JSON.stringify(continueAfterClear));
+    }
+
+    // --- tools/list exposes the conversations tool ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const list = await toolsList(baseUrl, sessionId, 99);
+      const names = (list?.tools ?? []).map((t) => t.name);
+      ok('tools/list includes the conversations tool', names.includes('conversations'), JSON.stringify(names));
+    }
+
     console.log(failed ? `\n${failed} FAILED\n` : '\nAll conversation e2e tests passed\n');
   } finally {
     child.kill();
@@ -271,6 +375,12 @@ async function main() {
       !('start_conversation' in chatProps) && !('conversation_id' in chatProps), JSON.stringify(Object.keys(chatProps)));
     ok('off: custom_prompt.inputSchema.properties has no conversation params',
       !('start_conversation' in cpProps) && !('conversation_id' in cpProps), JSON.stringify(Object.keys(cpProps)));
+    const toolNames = (list?.tools ?? []).map((t) => t.name);
+    ok('off: tools/list does not include the conversations tool', !toolNames.includes('conversations'), JSON.stringify(toolNames));
+
+    backend2.reset();
+    const { result: conversationsOffResult } = await callConversations(baseUrl2, sessionId, { action: 'list' }, 6);
+    ok('off: calling conversations is isError', conversationsOffResult?.isError === true, JSON.stringify(conversationsOffResult));
 
     backend2.reset();
     const { result: chatOffResult } = await callChat(baseUrl2, sessionId, { message: 'hi', max_tokens: 64, start_conversation: true }, 3);
