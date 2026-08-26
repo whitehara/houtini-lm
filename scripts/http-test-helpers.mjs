@@ -80,10 +80,11 @@ export function parseSseOrJson(text, contentType) {
   }
 }
 
-export async function post(baseUrl, path_, body, sessionId) {
+export async function post(baseUrl, path_, body, sessionId, extraHeaders = {}) {
   const headers = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    ...extraHeaders,
   };
   if (sessionId) headers['mcp-session-id'] = sessionId;
   const res = await fetch(`${baseUrl}${path_}`, { method: 'POST', headers, body: JSON.stringify(body) });
@@ -93,18 +94,23 @@ export async function post(baseUrl, path_, body, sessionId) {
 }
 
 /** Establishes one MCP session: initialize -> notifications/initialized. Returns { sessionId, initMessages }. */
-export async function initializeSession(baseUrl, path_ = '/mcp') {
+export async function initializeSession(baseUrl, path_ = '/mcp', extraHeaders = {}) {
   const initRes = await post(baseUrl, path_, {
     jsonrpc: '2.0', id: 1, method: 'initialize',
     params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'http-test', version: '0.1.0' } },
-  });
+  }, undefined, extraHeaders);
   const sessionId = initRes.headers.get('mcp-session-id');
   if (!sessionId) throw new Error('no mcp-session-id header on initialize response');
 
   // Fire-and-forget per JSON-RPC notification semantics (no id, no response expected).
   await fetch(`${baseUrl}${path_}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'mcp-session-id': sessionId,
+      ...extraHeaders,
+    },
     body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
   });
 

@@ -15,14 +15,17 @@
  * Multi-tenant safety (the reason this module exists in the shape it does):
  * every conversation is scoped to an *owner* key supplied by the caller.
  * This store treats `owner` as an opaque string and does no resolution of
- * its own — index.ts is responsible for deriving it per the session-ID
- * resolution rule (stdio transport → fixed key "stdio-local"; HTTP
- * transport → the MCP transport session ID, `extra.sessionId`, with no
- * fallback when that's undefined). Getting that resolution wrong is a
- * cross-tenant history leak, not a cosmetic bug, so it lives in index.ts
- * where the transport context is actually available and is reviewed
- * accordingly — this module just enforces that whatever owner string it's
- * given can never see another owner's conversations.
+ * its own — index.ts (resolveConversationOwner()) is responsible for
+ * deriving it, and does so one of two ways depending on server config:
+ * by default, the MCP transport session (stdio → fixed key "stdio-local";
+ * HTTP → `extra.sessionId`, with no fallback when that's undefined); or,
+ * when HOUTINI_LM_CONVERSATION_OWNER_HEADER is set, an authenticated user
+ * identity read from an HTTP request header instead. Either way, getting
+ * that resolution wrong is a cross-tenant history leak, not a cosmetic bug,
+ * so it lives in index.ts where the transport/request context is actually
+ * available and is reviewed accordingly — this module just enforces that
+ * whatever owner string it's given can never see another owner's
+ * conversations.
  *
  * No timers: `setInterval` would pin a stdio server process's event loop
  * open and block clean exit. Instead, expiry is a "lazy sweep" — every
@@ -267,7 +270,7 @@ function formatMinutes(minutes: number): string {
  */
 export function formatConversationList(summaries: ConversationSummary[], ttlMin: number, now: number): string {
   if (summaries.length === 0) {
-    return 'No active conversations on this connection. Start one by calling chat or custom_prompt with start_conversation: true.';
+    return 'No active conversations. Start one by calling chat or custom_prompt with start_conversation: true.';
   }
 
   const sorted = [...summaries].sort((a, b) => b.lastUsedAt - a.lastUsedAt);
@@ -280,7 +283,7 @@ export function formatConversationList(summaries: ConversationSummary[], ttlMin:
     const expiresMin = ttlMin - idleMin;
     lines.push(`| ${s.id} | ${s.turns} | ${s.chars} | ${formatMinutes(idleMin)} | ${formatMinutes(Math.max(0, expiresMin))} |`);
   }
-  lines.push('*Only conversations owned by this MCP connection are listed. Listing does not refresh idle timers.*');
+  lines.push('*Only your own conversations are listed. Listing does not refresh idle timers.*');
 
   return lines.join('\n');
 }

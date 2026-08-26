@@ -427,6 +427,16 @@ const CONVERSATION_TTL_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERS
 const CONVERSATION_MAX = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX || '50', 10) || 50);
 const CONVERSATION_MAX_TURNS = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX_TURNS || '40', 10) || 40);
 const CONVERSATION_MAX_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_CONVERSATION_MAX_CHARS || '48000', 10) || 48000);
+// Optional: when set, resolveConversationOwner() derives the owner key from
+// this HTTP request header (an authenticated user identity forwarded by a
+// front-end proxy) instead of the MCP session ID — see that function for the
+// fail-closed contract this enables. Only the header *name* is lower-cased
+// here (the SDK always hands back requestInfo.headers with lower-case keys,
+// since it builds them via Object.fromEntries() over a Web Headers object);
+// the header *value* is read verbatim in resolveConversationOwner() — lower-
+// casing an identity claim like `sub` could collapse two distinct users into
+// one owner key.
+const CONVERSATION_OWNER_HEADER = (process.env.HOUTINI_LM_CONVERSATION_OWNER_HEADER || '').trim().toLowerCase();
 const conversations = new ConversationStore({
   ttlMs: CONVERSATION_TTL_MIN * 60_000,
   maxConversations: CONVERSATION_MAX,
@@ -2144,6 +2154,14 @@ const CONVERSATIONS_DISABLED_MESSAGE = 'Error: server-side conversations are dis
 // for why this never falls back to a shared key).
 type ConversationOwner = { kind: 'owner'; owner: string } | { kind: 'error'; result: CallToolResult };
 
+// resolveConversationOwner()'s header-mode branch logs "not usable" to
+// stderr at most once per process (see that branch below) — this flag is
+// the suppression latch. Best-effort only: it's read and written by
+// synchronous code with no `await` between the check and the set, so under
+// Node's single-threaded event loop it cannot race within one call; a
+// duplicate line across calls would be harmless anyway, so no lock is used.
+let ownerHeaderWarned = false;
+
 /**
  * Resolve the caller's conversation owner key. This is the multi-tenant
  * safety boundary for server-side conversations — see conversation-store.ts's
@@ -2153,6 +2171,18 @@ type ConversationOwner = { kind: 'owner'; owner: string } | { kind: 'error'; res
  * independently. Two copies of this logic drifting apart (e.g. one
  * forgetting the "never fall back to a fixed key over HTTP" rule) would be
  * a cross-tenant history leak, not a cosmetic bug.
+ *
+ * Two resolution modes, selected once at startup by whether
+ * HOUTINI_LM_CONVERSATION_OWNER_HEADER is set:
+ *  - Unset (default): the owner key is the MCP session ID (stdio → the
+ *    fixed key "stdio-local"; HTTP → extra.sessionId). This scopes
+ *    conversations to one MCP connection.
+ *  - Set: the owner key is the value of the named HTTP request header — a
+ *    caller identity a front-end proxy is expected to attach after its own
+ *    authentication. This scopes conversations to that identity across MCP
+ *    sessions/connections instead. Neither mode ever falls back to the
+ *    other's key on failure — see the header branch below for why that
+ *    would defeat the point.
  */
 function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
   // HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's a reliable
@@ -2161,6 +2191,48 @@ function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
   if (HOUTINI_LM_TRANSPORT === 'stdio') {
     return { kind: 'owner', owner: 'stdio-local' };
   }
+
+  if (CONVERSATION_OWNER_HEADER !== '') {
+    // Header mode. This branch must never fall back to extra.sessionId: a
+    // caller that couldn't produce the identity header would then be
+    // scoped by MCP session instead, i.e. treated as its own anonymous
+    // owner — indistinguishable from a caller that *did* authenticate.
+    // That's a spoofing-equivalent hole, so any failure here is terminal
+    // (fail closed) rather than falling through to the session-ID branch
+    // below. extra.sessionId being unset is not itself an error in this
+    // mode — session establishment and owner resolution are independent.
+    const raw = extra.requestInfo?.headers[CONVERSATION_OWNER_HEADER];
+    // typeof raw !== 'string' also catches the array case (a duplicated
+    // header the SDK didn't collapse into one comma-joined string) and the
+    // absent-header case — both are "not usable", same as the checks below.
+    if (typeof raw !== 'string' || raw.includes(',') || raw.trim() === '' || raw.trim().length > 512) {
+      // At most once per process: log the expected header name and every
+      // header name that *did* arrive (names only, never values —
+      // authorization/cookie values must never reach stderr) so a
+      // misconfigured front-end proxy shows up in `docker service logs`
+      // instead of a silent wall of "server requires an authenticated user
+      // header" errors.
+      if (!ownerHeaderWarned) {
+        ownerHeaderWarned = true;
+        const seen = Object.keys(extra.requestInfo?.headers ?? {}).join(', ');
+        process.stderr.write(
+          `[houtini-lm] conversation owner header "${CONVERSATION_OWNER_HEADER}" not usable; headers seen: ${seen}\n`,
+        );
+      }
+      return {
+        kind: 'error',
+        result: {
+          content: [{ type: 'text', text: 'Error: server-side conversations require an authenticated user header on this server.' }],
+          isError: true,
+        },
+      };
+    }
+    // "hdr:" separates this mode's key space from the session-ID mode's key
+    // space (owner strings are opaque to ConversationStore either way, so
+    // this is purely a namespacing convention, not a security boundary).
+    return { kind: 'owner', owner: `hdr:${raw.trim()}` };
+  }
+
   if (extra.sessionId === undefined) {
     return {
       kind: 'error',
@@ -2226,7 +2298,7 @@ function resolveConversation(
           content: [{
             type: 'text',
             text:
-              'Error: this conversation has expired or does not belong to this connection. ' +
+              'Error: this conversation has expired or is not available to you. ' +
               'Start a new one with start_conversation: true.',
           }],
           isError: true,
@@ -2579,10 +2651,10 @@ const TOOLS: Tool[] = [
     name: 'conversations',
     description:
       'Manage server-side conversations started with chat or custom_prompt\'s start_conversation. Scoped to ' +
-      'this MCP connection only — you can never see or touch another connection\'s conversations, and this ' +
+      'conversations you own — you can never see or touch another owner\'s conversations, and this ' +
       'tool never reveals whether one exists. `list` returns metadata only (id, turn count, char count, idle ' +
       'time, expiry) — never message content. `delete` removes one conversation by conversation_id. `clear` ' +
-      'is destructive: it removes every conversation on this connection at once. There is no confirmation step ' +
+      'is destructive: it removes every conversation you own at once. There is no confirmation step ' +
       'for clear — call list first if you need to check what would be lost.',
     inputSchema: {
       type: 'object' as const,
@@ -2591,9 +2663,9 @@ const TOOLS: Tool[] = [
           type: 'string',
           enum: ['list', 'delete', 'clear'],
           description:
-            '"list": show this connection\'s conversations (metadata only, no message content). ' +
+            '"list": show your conversations (metadata only, no message content). ' +
             '"delete": remove one conversation — requires conversation_id. ' +
-            '"clear": remove every conversation on this connection.',
+            '"clear": remove every conversation you own.',
         },
         conversation_id: {
           type: 'string',
@@ -3391,10 +3463,10 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           }
           // Same message and isError regardless of whether conversation_id
           // never existed or belongs to a different owner — distinguishing
-          // the two would let a caller probe for other connections' ids.
+          // the two would let a caller probe for other owners' ids.
           if (!summaries.some((s) => s.id === conversation_id)) {
             return {
-              content: [{ type: 'text', text: 'Error: this conversation has expired or does not belong to this connection.' }],
+              content: [{ type: 'text', text: 'Error: this conversation has expired or is not available to you.' }],
               isError: true,
             };
           }
@@ -3403,7 +3475,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         }
 
         const cleared = conversations.clear(owner);
-        return { content: [{ type: 'text', text: `Cleared ${cleared} conversation${cleared === 1 ? '' : 's'} on this connection.` }] };
+        return { content: [{ type: 'text', text: `Cleared ${cleared} conversation${cleared === 1 ? '' : 's'}.` }] };
       }
 
       default:
@@ -3529,15 +3601,21 @@ async function startHttpTransport(): Promise<void> {
       },
     });
     transport.onclose = () => {
-      // Discard this session's conversations along with the session itself —
-      // the session id is also the conversation owner key (see
-      // resolveConversationOwner()), so once the MCP session is gone there is
-      // no way left to reach these conversations anyway. onclose only fires
-      // on an explicit DELETE or close, never on a transient SSE disconnect,
-      // so this can't wipe conversations out from under a client that's
-      // still mid-stream.
+      // The session id is only the conversation owner key when
+      // CONVERSATION_OWNER_HEADER is unset — in that mode, discarding this
+      // session's conversations along with the session itself is correct:
+      // once the MCP session is gone there is no way left to reach them
+      // anyway. onclose only fires on an explicit DELETE or close, never on
+      // a transient SSE disconnect, so this can't wipe conversations out
+      // from under a client that's still mid-stream.
+      // In header mode the owner key is the authenticated user identity,
+      // not the session id, so a conversation outlives the MCP session that
+      // created it by design — it's discarded only via `delete`, `clear`,
+      // or idle TTL expiry (see resolveConversationOwner()).
       if (transport.sessionId) {
-        conversations.clear(transport.sessionId);
+        if (CONVERSATION_OWNER_HEADER === '') {
+          conversations.clear(transport.sessionId);
+        }
         sessions.delete(transport.sessionId);
       }
     };
@@ -3552,6 +3630,9 @@ async function startHttpTransport(): Promise<void> {
     httpServer.listen(HOUTINI_LM_HTTP_PORT, HOUTINI_LM_HTTP_HOST, () => resolve());
   });
   process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)}) — http transport on ${HOUTINI_LM_HTTP_HOST}:${HOUTINI_LM_HTTP_PORT}${HOUTINI_LM_HTTP_PATH}\n`);
+  if (CONVERSATION_OWNER_HEADER !== '') {
+    process.stderr.write(`[houtini-lm] conversation owner header: ${CONVERSATION_OWNER_HEADER}\n`);
+  }
 
   const shutdown = () => {
     void (async () => {

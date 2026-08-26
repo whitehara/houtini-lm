@@ -134,7 +134,7 @@ docker run -d -p 3000:3000 \
 
 The server also answers `GET /healthz` with `200 {"status":"ok"}`, independent of `HOUTINI_LM_HTTP_PATH`, for container orchestrator health checks.
 
-Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` header; the response carries the session id in that same header, which the client then sends on every subsequent request. Send `DELETE` with the session id to end a session explicitly — there's currently no idle-session timeout, so a client that never deletes its session leaks it for the life of the process. Deleting a session also immediately discards any server-side conversations it owned (see [Server-side conversations](#server-side-conversations)) — there's no separate cleanup step for those.
+Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` header; the response carries the session id in that same header, which the client then sends on every subsequent request. Send `DELETE` with the session id to end a session explicitly — there's currently no idle-session timeout, so a client that never deletes its session leaks it for the life of the process. When `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is unset (the default), deleting a session also immediately discards any server-side conversations it owned (see [Server-side conversations](#server-side-conversations)) — there's no separate cleanup step for those. When that variable is set, conversations are owned by an authenticated caller identity instead of the session, so a session `DELETE` no longer discards them.
 
 **This server does not authenticate HTTP requests.** Don't expose it directly to the internet — put an authenticating reverse proxy (e.g. [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy)) in front of it, and keep the container itself reachable only from that proxy.
 
@@ -418,16 +418,16 @@ The reasoning-token overhead line is the canary for "is `reasoning_effort` actua
 
 ### `conversations`
 
-Manage server-side conversations started with `chat` or `custom_prompt`'s `start_conversation`. Scoped strictly to the calling MCP connection — this tool can never see, list, or touch another connection's conversations, and never reveals whether one exists elsewhere. Not listed in `tools/list` at all when `HOUTINI_LM_CONVERSATIONS` is disabled.
+Manage server-side conversations started with `chat` or `custom_prompt`'s `start_conversation`. Scoped strictly to the conversations you own — this tool can never see, list, or touch another owner's conversations, and never reveals whether one exists elsewhere. What "owner" means depends on `HOUTINI_LM_CONVERSATION_OWNER_HEADER` — see [Isolation boundary](#server-side-conversations) below. Not listed in `tools/list` at all when `HOUTINI_LM_CONVERSATIONS` is disabled.
 
 | Parameter | Required | Default | What it does |
 |-----------|----------|---------|-------------|
 | `action` | yes | - | `list`, `delete`, or `clear`. |
 | `conversation_id` | required for `delete` | - | Which conversation to remove. Ignored for `list` and `clear`. |
 
-- **`list`** — a markdown table of this connection's conversations: id, turn count, chars retained, idle time, time to expiry. Metadata only — message content is never returned, and structurally can't be, since `list` works from a summary type that has no content field.
-- **`delete`** — removes one conversation by `conversation_id`. An id that never existed and an id that belongs to a different connection return the *exact same* error, deliberately — distinguishing them would let a caller probe for other connections' conversations.
-- **`clear`** — removes every conversation on this connection in one call. There's no confirmation step; call `list` first if you need to know what's about to go.
+- **`list`** — a markdown table of your conversations: id, turn count, chars retained, idle time, time to expiry. Metadata only — message content is never returned, and structurally can't be, since `list` works from a summary type that has no content field.
+- **`delete`** — removes one conversation by `conversation_id`. An id that never existed and an id owned by someone else return the *exact same* error, deliberately — distinguishing them would let a caller probe for other owners' conversations.
+- **`clear`** — removes every conversation you own in one call. There's no confirmation step; call `list` first if you need to know what's about to go.
 
 See [Server-side conversations](#server-side-conversations) below for the full picture.
 
@@ -443,13 +443,16 @@ See [Server-side conversations](#server-side-conversations) below for the full p
 
 **Continuing one** — pass that id back as `conversation_id` on the next call and send *only* the new input (the new `message` for `chat`, the new `instruction` for `custom_prompt`). Never resend prior turns — the server already has them and prepends the stored history itself.
 
-**Cross-tool continuation** — `chat` and `custom_prompt` share the same store. Start a conversation with one and continue it with the other; only `conversation_id` identifies it (within the same owning connection), not which tool created it.
+**Cross-tool continuation** — `chat` and `custom_prompt` share the same store. Start a conversation with one and continue it with the other; only `conversation_id` identifies it, not which tool created it.
 
 **`custom_prompt`'s `context` gets special handling** — it's recorded into the conversation history only the first time it's sent for a given `conversation_id`. Resending the identical `context` string on every call is safe and won't duplicate it in the stored history — that's actually the recommended habit, because if `context` is ever trimmed out of the retained history as the conversation grows (see limits below), resending it re-adds it automatically on the next call. Omitting it after the first call also works, as long as it's still within the retained history.
 
-**Isolation boundary** — a conversation is bound to the MCP *connection* that created it, never to a fixed or shared key. Over stdio that's the single local process for that client. Over HTTP it's the `mcp-session-id`; if a call arrives over HTTP with no session established yet, server-side conversations refuse outright rather than silently falling back to a shared key — that fallback would leak history across unrelated callers.
+**Isolation boundary** — two modes, selected by whether `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is set:
 
-**Discarding conversations** — four ways: the [`conversations`](#conversations) tool's `delete` (one) or `clear` (all, on this connection); the idle timeout (`HOUTINI_LM_CONVERSATION_TTL_MIN`, default 60 minutes, measured from the conversation's last use); and, over HTTP, sending `DELETE` on the MCP session itself — that immediately discards every conversation owned by that session (see [Remote / HTTP transport](#remote--http-transport)).
+- **Unset (default)** — a conversation is bound to the MCP *connection* that created it, never to a fixed or shared key. Over stdio that's the single local process for that client. Over HTTP it's the `mcp-session-id`; if a call arrives over HTTP with no session established yet, server-side conversations refuse outright rather than silently falling back to a shared key — that fallback would leak history across unrelated callers.
+- **Set** — a conversation is bound to the value of the named HTTP request header instead, so the same caller can continue it across MCP sessions/connections (useful behind a gateway that reconnects on every call — see [Troubleshooting](manual/troubleshooting.md)). This server never falls back to the MCP session key when the header is missing or unusable; it fails the call outright. **Only set this if the front-end proxy in front of this server replaces any client-supplied header of the same name on every request rather than appending to it** — an appending proxy would let a client spoof another user's identity. mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` option is one way to produce such a header from an OIDC claim; consult its docs/source for the version you run to confirm it replaces rather than appends. As a second layer of defense, this server rejects the call outright if it ever sees more than one value for the header (a sign the header wasn't replaced) — but that check is not a substitute for a correctly configured proxy, only a way to fail loudly instead of silently trusting an ambiguous value.
+
+**Discarding conversations** — the [`conversations`](#conversations) tool's `delete` (one) or `clear` (all you own); the idle timeout (`HOUTINI_LM_CONVERSATION_TTL_MIN`, default 60 minutes, measured from the conversation's last use); and, over HTTP, **only when `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is unset**, sending `DELETE` on the MCP session itself — that immediately discards every conversation owned by that session (see [Remote / HTTP transport](#remote--http-transport)). When the owner header is set, a session `DELETE` no longer discards conversations — they outlive the session that created them by design, and are discarded only via `delete`/`clear`/idle TTL.
 
 **Known limitations** — this is a lightweight, in-memory feature, not a durable chat log:
 - Everything is lost on a process restart or redeploy. Nothing is persisted to disk.
@@ -457,6 +460,7 @@ See [Server-side conversations](#server-side-conversations) below for the full p
 - Concurrent calls appending to the *same* `conversation_id` at the same time have no guaranteed ordering.
 - `custom_prompt`'s "don't duplicate this context" check is an exact string match — whitespace or formatting differences between calls mean it won't be recognised as the same context, and will be recorded again.
 - Long conversations quietly shrink the output budget: `max_tokens` is capped against the whole prompt, retained history included, to fit the model's context window — so a long-running conversation can end up with less room for the answer than a fresh call would get, with no separate warning beyond the usual quality flags (e.g. `TRUNCATED`).
+- With `HOUTINI_LM_CONVERSATION_OWNER_HEADER` set, a conversation is no longer discarded when its creating MCP session ends — it stays in process memory until the idle TTL (`HOUTINI_LM_CONVERSATION_TTL_MIN`, default 60 minutes) expires, or until `delete`/`clear` is called.
 
 **Sizing note** — a single very long `context` passed to `custom_prompt` can by itself consume most or all of `HOUTINI_LM_CONVERSATION_MAX_CHARS` (default 48,000 characters) in one call. If you plan to lean on `context` heavily inside a conversation, consider raising that variable — see [Configuration](#configuration).
 
@@ -612,9 +616,10 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model and suppresses it when detected, `off` forces the no-think path for every call, `on` forces thinking on for models known to support a toggle (sends `enable_thinking: true`, skips `reasoning_effort`, and inflates `max_tokens` the same way suppression does). `off` always wins — it overrides both `on` and a per-call `force_thinking: true`. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes — and **required for vLLM served under an alias** (e.g. `coder-next`), where HF-metadata detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Use `on` (server-wide) or `force_thinking: true` (per call) when you want the local model's own reasoning surfaced via `include_reasoning: true`. |
 | `HOUTINI_LM_CONVERSATIONS` | `1` (on) | Enables `start_conversation`/`conversation_id` on `chat` and `custom_prompt`, and the `conversations` tool. Set to `0` (also accepts `false`/`no`/`off`) to disable — both parameters and the `conversations` tool disappear from the schema entirely rather than being present and erroring. See [Server-side conversations](#server-side-conversations). |
 | `HOUTINI_LM_CONVERSATION_TTL_MIN` | `60` | Idle-expiry window for a server-side conversation, in minutes, measured from its last use. |
-| `HOUTINI_LM_CONVERSATION_MAX` | `50` | Max conversations held at once, across all connections. Oldest by last use is evicted on overflow. |
+| `HOUTINI_LM_CONVERSATION_MAX` | `50` | Max conversations held at once, across all owners. Oldest by last use is evicted on overflow. |
 | `HOUTINI_LM_CONVERSATION_MAX_TURNS` | `40` | Max user/assistant turns retained per conversation before the oldest are trimmed. |
 | `HOUTINI_LM_CONVERSATION_MAX_CHARS` | `48000` | Max total characters retained per conversation before the oldest turns are trimmed. A single very long `custom_prompt` `context` can consume most of this budget in one call — raise it if you lean on `context` heavily inside conversations. See [Server-side conversations](#server-side-conversations). |
+| `HOUTINI_LM_CONVERSATION_OWNER_HEADER` | unset | Name of an HTTP request header carrying an authenticated caller identity; when set, conversations are scoped to that identity instead of the MCP session. See [Server-side conversations § Isolation boundary](#server-side-conversations). |
 
 **Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 

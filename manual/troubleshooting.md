@@ -68,15 +68,15 @@ Check the model's real context window in `discover`, not the family's advertised
 
 Per-model stats key on the model id the backend reports. Serve the same weights under two ids (or through a router that renames them) and you get two histories. Cosmetic, but worth knowing before you conclude the model got slower - check which id the footer names.
 
-## conversation_id fails with "this conversation has expired or does not belong to this connection"
+## conversation_id fails with "this conversation has expired or is not available to you"
 
-**One of five things happened to that conversation, and the tool deliberately won't say which** - telling them apart would let a caller probe for other connections' conversations, so `chat`, `custom_prompt`, and the `conversations` tool's `delete` action all give this same "expired or does not belong to this connection" wording regardless of the cause (chat/custom_prompt add a reminder to start a new one; `delete` doesn't need to):
+**One of five things happened to that conversation, and the tool deliberately won't say which** - telling them apart would let a caller probe for other owners' conversations, so `chat`, `custom_prompt`, and the `conversations` tool's `delete` action all give this same "expired or is not available to you" wording regardless of the cause (chat/custom_prompt add a reminder to start a new one; `delete` doesn't need to):
 
 - It sat idle past `HOUTINI_LM_CONVERSATION_TTL_MIN` (default 60 minutes) and was swept away.
-- It was evicted by the LRU cap - `HOUTINI_LM_CONVERSATION_MAX` (default 50) conversations total, across every connection, and this one was the oldest when a new one pushed past the limit.
+- It was evicted by the LRU cap - `HOUTINI_LM_CONVERSATION_MAX` (default 50) conversations total, across every owner, and this one was the oldest when a new one pushed past the limit.
 - The server process restarted or was redeployed - conversations are in-memory only, nothing survives that.
-- You're on the HTTP transport and reconnected, landing on a new `mcp-session-id` - conversations are scoped to the MCP session that created them, and a fresh session can't see the old one's (including one you deliberately or accidentally `DELETE`d).
-- The id belongs to a different MCP connection entirely.
+- You're on the HTTP transport and reconnected, landing on a new `mcp-session-id` - conversations are scoped to the MCP session that created them, and a fresh session can't see the old one's (including one you deliberately or accidentally `DELETE`d). **This does not apply on a server running with `HOUTINI_LM_CONVERSATION_OWNER_HEADER` set** - there, conversations are scoped to an authenticated caller identity instead of the session, so a new session from the same caller can still see them.
+- The id belongs to a different owner entirely.
 
 There's nothing to recover - start a new conversation with `start_conversation: true` rather than retrying the old id. See [Server-side conversations](../README.md#server-side-conversations) in the README for how the lifecycle works.
 
