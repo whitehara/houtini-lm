@@ -68,6 +68,18 @@ Check the model's real context window in `discover`, not the family's advertised
 
 Per-model stats key on the model id the backend reports. Serve the same weights under two ids (or through a router that renames them) and you get two histories. Cosmetic, but worth knowing before you conclude the model got slower - check which id the footer names.
 
+## conversation_id fails with "this conversation has expired or does not belong to this connection"
+
+**One of five things happened to that conversation, and the tool deliberately won't say which** - telling them apart would let a caller probe for other connections' conversations, so `chat`, `custom_prompt`, and the `conversations` tool's `delete` action all give this same "expired or does not belong to this connection" wording regardless of the cause (chat/custom_prompt add a reminder to start a new one; `delete` doesn't need to):
+
+- It sat idle past `HOUTINI_LM_CONVERSATION_TTL_MIN` (default 60 minutes) and was swept away.
+- It was evicted by the LRU cap - `HOUTINI_LM_CONVERSATION_MAX` (default 50) conversations total, across every connection, and this one was the oldest when a new one pushed past the limit.
+- The server process restarted or was redeployed - conversations are in-memory only, nothing survives that.
+- You're on the HTTP transport and reconnected, landing on a new `mcp-session-id` - conversations are scoped to the MCP session that created them, and a fresh session can't see the old one's (including one you deliberately or accidentally `DELETE`d).
+- The id belongs to a different MCP connection entirely.
+
+There's nothing to recover - start a new conversation with `start_conversation: true` rather than retrying the old id. See [Server-side conversations](../README.md#server-side-conversations) in the README for how the lifecycle works.
+
 ## Where to look when none of this fits
 
 The server logs everything interesting to **stderr** (stdout is the MCP transport and stays clean - any log line you see mixed into responses is a bug, report it). In Claude Desktop, the MCP log files capture stderr per server: look for `[houtini-lm]` lines - budget overrides, thinking-mode decisions, retry attempts and lock waits are all narrated there. Failing that, the [issues page](https://github.com/houtini-ai/houtini-lm/issues) - a footer, the stderr lines, and your backend's version is usually enough to diagnose anything.

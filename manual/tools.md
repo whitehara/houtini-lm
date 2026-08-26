@@ -1,6 +1,6 @@
 # The tools, in depth
 
-Eight tools. Five do inference, three tell you about the setup. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
+Nine tools. Five do inference, three tell you about the setup, and one manages server-side conversations. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
 
 ## chat
 
@@ -19,6 +19,8 @@ The general-purpose tool. One message in, one response out, routed to the best l
 - `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty` - the full sampling set, range-validated server-side, forwarded only when you set them.
 - `include_reasoning` - default `false`. Set `true` to append the model's reasoning after the answer (delimited, so you can check how it got there) when the backend actually returns reasoning. No effect, no error, if the model didn't produce any — and by default it usually won't have any, because thinking-capable models get suppressed automatically (see below).
 - `force_thinking` - default `false`. Set `true` to disable that automatic suppression for this one call, so the model actually thinks. Costs latency and generated tokens; pair with `include_reasoning: true` to see the result. A no-op if the server's running with `HOUTINI_LM_THINKING=off` — that setting always wins.
+- `start_conversation` - default `false`. Set `true` to have the server remember this conversation for you - the id comes back on the response's last line, ready to pass as `conversation_id` next time. See [Server-side conversations](../README.md#server-side-conversations) in the README for the full picture. Not in the schema at all if the server's running with `HOUTINI_LM_CONVERSATIONS=0`.
+- `conversation_id` - continue a conversation started with `start_conversation: true`. Send only the new message; the server prepends the stored history for you. Wins over `start_conversation` if both are set.
 
 ## custom_prompt
 
@@ -32,7 +34,9 @@ Reach for it when the material and the ask are separate things:
 
 Field discipline: `system` under 30 words, `context` complete and untruncated, `instruction` under 50 words with the output format stated. The narrower the instruction, the better a small model follows it.
 
-Also accepts `include_reasoning` and `force_thinking` (both default `false`) - same as `chat`.
+Also accepts `include_reasoning` and `force_thinking` (both default `false`) - same as `chat`, plus `start_conversation`/`conversation_id` - also same as `chat`, sending only the new `instruction` on continuation calls.
+
+When you're continuing a conversation, `context` gets special treatment: it's only recorded into the stored history the first time you send it for that `conversation_id`, so resending the same block on every call is safe and won't duplicate it. That's the recommended habit, in fact - if a long conversation ever trims `context` out of its retained history, resending it puts it straight back.
 
 ## code_task
 
@@ -74,6 +78,14 @@ Everything the backend has, loaded and merely downloaded, with per-model metadat
 Just the numbers, no catalogue: tokens offloaded, calls made, per-model TTFT and tok/s - session and lifetime, persisted in `~/.houtini-lm/model-cache.db` across restarts. Also reports the reasoning-token overhead ratio, which is worth glancing at: if a big share of your completion tokens are going on hidden thinking, your no-think configuration isn't landing (see [troubleshooting](troubleshooting.md#responses-are-slow-and-the-token-counts-look-inflated)).
 
 The 💰 line is cumulative Claude quota kept in your pocket. It climbs quickly once `code_task_files` is in play.
+
+## conversations
+
+Housekeeping for the server-side conversations `chat` and `custom_prompt` can start with `start_conversation: true` - see [Server-side conversations](../README.md#server-side-conversations) in the README for how those work. This tool never shows or touches anything outside the calling MCP connection.
+
+Three actions, chosen with the `action` parameter: `list` returns a table of this connection's conversations - id, turn count, chars retained, idle time, expiry - metadata only, never message content. `delete` removes one by `conversation_id`; an id that never existed and one that belongs to a different connection get the identical error, on purpose, so the error can't be used to probe for other connections' ids. `clear` removes everything on this connection at once, with no confirmation step - call `list` first if you want to know what you're about to lose.
+
+Not in the tool list at all if the server's running with `HOUTINI_LM_CONVERSATIONS=0`.
 
 ## Reading the footer
 

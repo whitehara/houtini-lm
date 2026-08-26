@@ -13,6 +13,17 @@
 #                             seal file access off remotely instead (optional, default: shared mount)
 # HOUTINI_LM_SERIALISE      — serialise concurrent inference calls, 0/1 (optional, default: 0 — no benefit against a cloud backend)
 # HOUTINI_LM_CROSS_PROCESS_LOCK — cross-process inference lock, 0/1 (optional, default: 0)
+# HOUTINI_LM_CONVERSATIONS       — enable/disable server-side conversations (start_conversation/
+#                             conversation_id on chat and custom_prompt, plus the conversations
+#                             tool), 1/0 (optional, default: 1)
+# HOUTINI_LM_CONVERSATION_TTL_MIN   — conversation idle-expiry window in minutes (optional, default: 60)
+# HOUTINI_LM_CONVERSATION_MAX       — max conversations held at once, across all connections (optional, default: 50)
+# HOUTINI_LM_CONVERSATION_MAX_TURNS — max turns retained per conversation (optional, default: 40)
+# HOUTINI_LM_CONVERSATION_MAX_CHARS — max chars retained per conversation (optional, default: 48000)
+#                             Unlike the variables above, these five are passed through below with
+#                             an empty-string fallback (${VAR:-}), not a number baked into this
+#                             file — the one true default for each lives in src/index.ts, so this
+#                             file can never silently drift out of sync with it.
 # OIDC_CLIENT_ID            — OIDC client id for mcp-auth-proxy (required, secret)
 # OIDC_CLIENT_SECRET        — OIDC client secret for mcp-auth-proxy (required, secret)
 # OIDC_CONFIGURATION_URL    — OIDC discovery document URL (required, secret)
@@ -70,6 +81,11 @@ services:
       - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/mnt/houtini-lm-share}
       - HOUTINI_LM_SERIALISE=${HOUTINI_LM_SERIALISE:-0}
       - HOUTINI_LM_CROSS_PROCESS_LOCK=${HOUTINI_LM_CROSS_PROCESS_LOCK:-0}
+      - HOUTINI_LM_CONVERSATIONS=${HOUTINI_LM_CONVERSATIONS:-}
+      - HOUTINI_LM_CONVERSATION_TTL_MIN=${HOUTINI_LM_CONVERSATION_TTL_MIN:-}
+      - HOUTINI_LM_CONVERSATION_MAX=${HOUTINI_LM_CONVERSATION_MAX:-}
+      - HOUTINI_LM_CONVERSATION_MAX_TURNS=${HOUTINI_LM_CONVERSATION_MAX_TURNS:-}
+      - HOUTINI_LM_CONVERSATION_MAX_CHARS=${HOUTINI_LM_CONVERSATION_MAX_CHARS:-}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
       - houtini-lm_shared:/mnt/houtini-lm-share:ro
@@ -83,6 +99,10 @@ services:
       start_period: 10s
     deploy:
       mode: replicated
+      # Server-side conversations live in memory, per process, not shared
+      # across replicas — raising this above 1 would let a client's calls
+      # land on a different replica mid-conversation and silently lose its
+      # history. Keep this at 1 (or set HOUTINI_LM_CONVERSATIONS=0 first).
       replicas: 1
       restart_policy:
         condition: any

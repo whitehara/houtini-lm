@@ -14,12 +14,14 @@ src/
                       provider-profile registry
   model-cache.ts      SQLite (node:sqlite, WAL) — model profiles, thinking-
                       support detection, per-model performance history
+  conversation-store.ts In-memory, TTL-bounded store for server-side
+                      chat/custom_prompt conversation history (phase 9)
 server.json           MCP registry manifest
 scripts/test.mjs      Direct-client integration tests (hits /v1 endpoints)
 scripts/test-mcp-e2e.mjs End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
 scripts/benchmark.mjs Throughput + savings benchmark
-scripts/shakedown.mjs End-to-end self-test — runs 7 of the 8 tools in sequence (all except stats)
+scripts/shakedown.mjs End-to-end self-test — runs 7 of the 9 tools in sequence (all except stats and conversations)
 docs/SHAKEDOWN.md     Canonical test prompt (for running via Claude chat)
 scripts/add-shebang.mjs Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
@@ -315,7 +317,7 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 ## Testing
 
-Four independent test harnesses, each with a different scope:
+Nine independent test harnesses, each with a different scope:
 
 - **`scripts/test.mjs`** — **direct-client** integration test. Hits the provider's
   `/v1/*` endpoints without going through the MCP server. Good for
@@ -332,9 +334,28 @@ Four independent test harnesses, each with a different scope:
   override.
 - **`scripts/benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`scripts/shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs 7 of the 8 tools end-to-end (all except `stats`) and prints a summary table with TTFT, tok/s,
+  Runs 7 of the 9 tools end-to-end (all except `stats` and `conversations`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
+- **`scripts/test-conversation-store.mjs`** (`npm run test:conversations`) —
+  **unit** test for `ConversationStore` and `formatConversationLine`/
+  `formatConversationList`. Pure logic, no backend or built server needed.
+- **`scripts/test-conversations-e2e.mjs`** (`npm run test:conversations:e2e`) —
+  **end-to-end conversations over HTTP**. Spawns `dist/index.js` with
+  `HOUTINI_LM_TRANSPORT=http` against `fake-openai-backend.mjs` and drives
+  `start_conversation`/`conversation_id` through real `chat`/`custom_prompt`/
+  `conversations` tool calls.
+- **`scripts/test-conversations-stdio-e2e.mjs`** (`npm run test:conversations:stdio`) —
+  the stdio-transport counterpart to the above. HTTP always has an MCP
+  session id, so this is what actually exercises the
+  `HOUTINI_LM_TRANSPORT === 'stdio'` owner-resolution branch.
+- **`scripts/test-http-transport.mjs`** (`npm run test:http`) — verifies the
+  Streamable HTTP transport itself: session lifecycle, `tools/list`,
+  `tools/call` with progress notifications routed to the correct session,
+  concurrent-session isolation, `DELETE`, and `/healthz`. Backend-free.
+- **`scripts/test-progress-notifications.mjs`** (`npm run test:progress`) —
+  verifies `notifications/progress` is request-scoped and byte-shape-identical
+  to before the `sendNotification` plumbing was introduced. Backend-free.
 
 The conversational equivalent lives in [SHAKEDOWN.md](./docs/SHAKEDOWN.md) —
 paste it into a Claude session with houtini-lm attached and Claude drives

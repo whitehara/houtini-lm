@@ -32,13 +32,13 @@ This README is the overview. The depth lives in focused pages:
 | Page | What's in it |
 |---|---|
 | [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
-| [The tools, in depth](./manual/tools.md) | All eight tools: the parameters that matter, reading the footer, the max_tokens floor |
+| [The tools, in depth](./manual/tools.md) | All nine tools: the parameters that matter, reading the footer, the max_tokens floor |
 | [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
 | [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
 | [LM Studio setup](./docs/SETUP-LMSTUDIO.md) · [Ollama setup](./docs/SETUP-OLLAMA.md) · [vLLM setup](./docs/SETUP-VLLM.md) | Backend guides, each with the traps that cause silent failures |
 | [vLLM backend notes](./docs/VLLM-BACKEND.md) | The deeper operational record: router topology, thinking toggles, token budgets |
 | [CLI mode](./docs/CLI-MODE.md) | Running houtini-lm as a command, not just an MCP server |
-| [Shakedown test](./docs/SHAKEDOWN.md) | The canonical end-to-end check - `npm run shakedown`, or paste the prompt into Claude and watch all eight tools run |
+| [Shakedown test](./docs/SHAKEDOWN.md) | The canonical end-to-end check - `npm run shakedown`, or paste the prompt into Claude and watch the seven-tool sequence run |
 | [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
 
 ## How it works
@@ -134,7 +134,7 @@ docker run -d -p 3000:3000 \
 
 The server also answers `GET /healthz` with `200 {"status":"ok"}`, independent of `HOUTINI_LM_HTTP_PATH`, for container orchestrator health checks.
 
-Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` header; the response carries the session id in that same header, which the client then sends on every subsequent request. Send `DELETE` with the session id to end a session explicitly — there's currently no idle-session timeout, so a client that never deletes its session leaks it for the life of the process.
+Each new session is a `POST` to `HOUTINI_LM_HTTP_PATH` with no `mcp-session-id` header; the response carries the session id in that same header, which the client then sends on every subsequent request. Send `DELETE` with the session id to end a session explicitly — there's currently no idle-session timeout, so a client that never deletes its session leaks it for the life of the process. Deleting a session also immediately discards any server-side conversations it owned (see [Server-side conversations](#server-side-conversations)) — there's no separate cleanup step for those.
 
 **This server does not authenticate HTTP requests.** Don't expose it directly to the internet — put an authenticating reverse proxy (e.g. [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy)) in front of it, and keep the container itself reachable only from that proxy.
 
@@ -317,6 +317,8 @@ The workhorse. Send a task, get an answer. The description includes planning tri
 | `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
 | `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
+| `start_conversation` | no | `false` | Start a new server-side conversation — its id comes back on the response's last line. Pass that id as `conversation_id` on every following call and send only the new message; the server keeps the history for you. Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
+| `conversation_id` | no | - | Continue a conversation started with `start_conversation: true` — send only the new message, the server prepends the stored history automatically. Wins over `start_conversation` when both are given (the latter is then ignored). Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
 
 ### `custom_prompt`
 
@@ -333,6 +335,8 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). Combining with `json_schema` means the response is no longer pure JSON, same as the footer already does. |
 | `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
+| `start_conversation` | no | `false` | Start a new server-side conversation — its id comes back on the response's last line. Pass that id as `conversation_id` on every following call and send only the new instruction; the server keeps the history for you. Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
+| `conversation_id` | no | - | Continue a conversation started with `start_conversation: true` — send only the new instruction, the server prepends the stored history automatically. Wins over `start_conversation` when both are given (the latter is then ignored). Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
 
 ### `code_task`
 
@@ -412,6 +416,52 @@ Example output:
 
 The reasoning-token overhead line is the canary for "is `reasoning_effort` actually being honoured on this model and this backend?" — above ~30% is a signal to investigate.
 
+### `conversations`
+
+Manage server-side conversations started with `chat` or `custom_prompt`'s `start_conversation`. Scoped strictly to the calling MCP connection — this tool can never see, list, or touch another connection's conversations, and never reveals whether one exists elsewhere. Not listed in `tools/list` at all when `HOUTINI_LM_CONVERSATIONS` is disabled.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `action` | yes | - | `list`, `delete`, or `clear`. |
+| `conversation_id` | required for `delete` | - | Which conversation to remove. Ignored for `list` and `clear`. |
+
+- **`list`** — a markdown table of this connection's conversations: id, turn count, chars retained, idle time, time to expiry. Metadata only — message content is never returned, and structurally can't be, since `list` works from a summary type that has no content field.
+- **`delete`** — removes one conversation by `conversation_id`. An id that never existed and an id that belongs to a different connection return the *exact same* error, deliberately — distinguishing them would let a caller probe for other connections' conversations.
+- **`clear`** — removes every conversation on this connection in one call. There's no confirmation step; call `list` first if you need to know what's about to go.
+
+See [Server-side conversations](#server-side-conversations) below for the full picture.
+
+## Server-side conversations
+
+`chat` and `custom_prompt` can remember a conversation across calls entirely server-side, so the caller stops resending the whole transcript on every turn. This is fully opt-in: leave `start_conversation` and `conversation_id` unset on both tools and nothing changes — the server behaves exactly as it did before this feature existed.
+
+**Starting one** — pass `start_conversation: true` to `chat` or `custom_prompt`. The response gets a trailing line like:
+
+```
+💬 Conversation a1b2c3d4-5678-... — 2 turns, 340 chars retained. Idle-expires in 60min. Continue with conversation_id: "a1b2c3d4-5678-...".
+```
+
+**Continuing one** — pass that id back as `conversation_id` on the next call and send *only* the new input (the new `message` for `chat`, the new `instruction` for `custom_prompt`). Never resend prior turns — the server already has them and prepends the stored history itself.
+
+**Cross-tool continuation** — `chat` and `custom_prompt` share the same store. Start a conversation with one and continue it with the other; only `conversation_id` identifies it (within the same owning connection), not which tool created it.
+
+**`custom_prompt`'s `context` gets special handling** — it's recorded into the conversation history only the first time it's sent for a given `conversation_id`. Resending the identical `context` string on every call is safe and won't duplicate it in the stored history — that's actually the recommended habit, because if `context` is ever trimmed out of the retained history as the conversation grows (see limits below), resending it re-adds it automatically on the next call. Omitting it after the first call also works, as long as it's still within the retained history.
+
+**Isolation boundary** — a conversation is bound to the MCP *connection* that created it, never to a fixed or shared key. Over stdio that's the single local process for that client. Over HTTP it's the `mcp-session-id`; if a call arrives over HTTP with no session established yet, server-side conversations refuse outright rather than silently falling back to a shared key — that fallback would leak history across unrelated callers.
+
+**Discarding conversations** — four ways: the [`conversations`](#conversations) tool's `delete` (one) or `clear` (all, on this connection); the idle timeout (`HOUTINI_LM_CONVERSATION_TTL_MIN`, default 60 minutes, measured from the conversation's last use); and, over HTTP, sending `DELETE` on the MCP session itself — that immediately discards every conversation owned by that session (see [Remote / HTTP transport](#remote--http-transport)).
+
+**Known limitations** — this is a lightweight, in-memory feature, not a durable chat log:
+- Everything is lost on a process restart or redeploy. Nothing is persisted to disk.
+- `deploy.replicas` must stay at `1`. The store is in-memory and per-process, not shared between replicas — a client bounced onto a different replica would find its conversation gone.
+- Concurrent calls appending to the *same* `conversation_id` at the same time have no guaranteed ordering.
+- `custom_prompt`'s "don't duplicate this context" check is an exact string match — whitespace or formatting differences between calls mean it won't be recognised as the same context, and will be recorded again.
+- Long conversations quietly shrink the output budget: `max_tokens` is capped against the whole prompt, retained history included, to fit the model's context window — so a long-running conversation can end up with less room for the answer than a fresh call would get, with no separate warning beyond the usual quality flags (e.g. `TRUNCATED`).
+
+**Sizing note** — a single very long `context` passed to `custom_prompt` can by itself consume most or all of `HOUTINI_LM_CONVERSATION_MAX_CHARS` (default 48,000 characters) in one call. If you plan to lean on `context` heavily inside a conversation, consider raising that variable — see [Configuration](#configuration).
+
+**Turning it off** — set `HOUTINI_LM_CONVERSATIONS=0` (also accepts `false`/`no`/`off`) and both parameters disappear from `chat`'s and `custom_prompt`'s schemas entirely, and the `conversations` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call.
+
 ## Structured JSON output
 
 Both `chat` and `custom_prompt` accept a `json_schema` parameter that forces the response to conform to a JSON Schema. LM Studio uses grammar-based sampling to guarantee valid output - no hoping the model remembers to close its brackets.
@@ -466,7 +516,7 @@ The canonical way to verify an install and get an honest read on what the loaded
 npm run shakedown
 ```
 
-This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the eight tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` is not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the nine tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` and `conversations` are not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
 
 Sample output tail:
 
@@ -560,6 +610,11 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to disable inference serialisation entirely (both the in-process semaphore and the cross-process lock). Use for backends that batch natively (vLLM, TGI, SGLang) where one-at-a-time only throttles throughput. |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Values below the floor are ignored and the dynamic budget (25% of the model's context window) applies — MCP clients habitually pass tiny caps like 256 that strangle reasoning models. Set to `0` to honour any value (e.g. deliberate micro-chunking on slow hardware). |
 | `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model and suppresses it when detected, `off` forces the no-think path for every call, `on` forces thinking on for models known to support a toggle (sends `enable_thinking: true`, skips `reasoning_effort`, and inflates `max_tokens` the same way suppression does). `off` always wins — it overrides both `on` and a per-call `force_thinking: true`. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes — and **required for vLLM served under an alias** (e.g. `coder-next`), where HF-metadata detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Use `on` (server-wide) or `force_thinking: true` (per call) when you want the local model's own reasoning surfaced via `include_reasoning: true`. |
+| `HOUTINI_LM_CONVERSATIONS` | `1` (on) | Enables `start_conversation`/`conversation_id` on `chat` and `custom_prompt`, and the `conversations` tool. Set to `0` (also accepts `false`/`no`/`off`) to disable — both parameters and the `conversations` tool disappear from the schema entirely rather than being present and erroring. See [Server-side conversations](#server-side-conversations). |
+| `HOUTINI_LM_CONVERSATION_TTL_MIN` | `60` | Idle-expiry window for a server-side conversation, in minutes, measured from its last use. |
+| `HOUTINI_LM_CONVERSATION_MAX` | `50` | Max conversations held at once, across all connections. Oldest by last use is evicted on overflow. |
+| `HOUTINI_LM_CONVERSATION_MAX_TURNS` | `40` | Max user/assistant turns retained per conversation before the oldest are trimmed. |
+| `HOUTINI_LM_CONVERSATION_MAX_CHARS` | `48000` | Max total characters retained per conversation before the oldest turns are trimmed. A single very long `custom_prompt` `context` can consume most of this budget in one call — raise it if you lean on `context` heavily inside conversations. See [Server-side conversations](#server-side-conversations). |
 
 **Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 
