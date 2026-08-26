@@ -58,7 +58,7 @@ async function main() {
     backend.reset();
     const first = await callTool('chat', { message: 'first turn', max_tokens: 64, start_conversation: true });
     const firstText = textOf(first.result);
-    ok('stdio: start_conversation is not a "needs an MCP session" error', first.result?.isError !== true && !firstText.includes('MCPセッションが必要です'), JSON.stringify(first.result));
+    ok('stdio: start_conversation is not a "needs an MCP session" error', first.result?.isError !== true && !firstText.includes('require an MCP session'), JSON.stringify(first.result));
     const firstMatch = firstText.match(UUID_RE);
     ok('stdio: start_conversation response contains a UUID-shaped conversation id', !!firstMatch, firstText);
     const conversationId = firstMatch?.[0];
@@ -94,7 +94,7 @@ async function main() {
     // --- 9/10: the `conversations` tool works over the fixed stdio owner key and never returns message bodies ---
     const list = await callTool('conversations', { action: 'list' });
     const listText = textOf(list.result);
-    ok('stdio: conversations list is not a "needs an MCP session" error', list.result?.isError !== true && !listText.includes('MCPセッションが必要です'), JSON.stringify(list.result));
+    ok('stdio: conversations list is not a "needs an MCP session" error', list.result?.isError !== true && !listText.includes('require an MCP session'), JSON.stringify(list.result));
     ok('stdio: conversations list includes this owner\'s conversation id', listText.includes(conversationId), listText);
     ok('stdio: conversations list does not include a message body', !listText.includes('first turn'), listText);
 

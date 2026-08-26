@@ -2136,7 +2136,7 @@ type ConversationContext =
 // Shared verbatim between resolveConversation() below and every other call
 // site that needs to know whether server-side conversations are turned on
 // at all — one literal, so the wording can never drift between them.
-const CONVERSATIONS_DISABLED_MESSAGE = 'Error: この houtini-lm インスタンスでは会話保持が無効です。';
+const CONVERSATIONS_DISABLED_MESSAGE = 'Error: server-side conversations are disabled on this houtini-lm instance.';
 
 // Result of resolveConversationOwner() below: either the owner key this
 // caller is scoped to, or the isError result to return unchanged because
@@ -2165,7 +2165,7 @@ function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
     return {
       kind: 'error',
       result: {
-        content: [{ type: 'text', text: 'Error: 会話履歴機能にはMCPセッションが必要です' }],
+        content: [{ type: 'text', text: 'Error: server-side conversations require an MCP session.' }],
         isError: true,
       },
     };
@@ -2226,8 +2226,8 @@ function resolveConversation(
           content: [{
             type: 'text',
             text:
-              'Error: この会話は失効したか、この接続のものではありません。' +
-              'start_conversation: true で新しい会話を開始し直してください。',
+              'Error: this conversation has expired or does not belong to this connection. ' +
+              'Start a new one with start_conversation: true.',
           }],
           isError: true,
         },
@@ -3529,7 +3529,17 @@ async function startHttpTransport(): Promise<void> {
       },
     });
     transport.onclose = () => {
-      if (transport.sessionId) sessions.delete(transport.sessionId);
+      // Discard this session's conversations along with the session itself —
+      // the session id is also the conversation owner key (see
+      // resolveConversationOwner()), so once the MCP session is gone there is
+      // no way left to reach these conversations anyway. onclose only fires
+      // on an explicit DELETE or close, never on a transient SSE disconnect,
+      // so this can't wipe conversations out from under a client that's
+      // still mid-stream.
+      if (transport.sessionId) {
+        conversations.clear(transport.sessionId);
+        sessions.delete(transport.sessionId);
+      }
     };
     await newServer.connect(transport);
     // Do not pre-read `req` — handing it to handleRequest as a live stream
