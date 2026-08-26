@@ -34,10 +34,18 @@
 #                             header this server looks for will never arrive.
 # MCP_AUTH_PROXY_HEADER_MAPPING — mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` equivalent:
 #                             a JSON-pointer-to-header-name mapping (e.g. "/sub:X-Forwarded-User")
-#                             that forwards an OIDC userinfo claim as the request header
+#                             that forwards an OIDC claim as the request header
 #                             HOUTINI_LM_CONVERSATION_OWNER_HEADER above expects (optional, default:
 #                             unset). Leave both of these two variables unset together; setting only
 #                             one has no effect.
+# MCP_AUTH_PROXY_HEADER_MAPPING_BASE — mcp-auth-proxy's `--header-mapping-base`/`HEADER_MAPPING_BASE`
+#                             equivalent: the JSON-pointer base path the above mapping's pointers are
+#                             resolved against (optional, default when unset: mcp-auth-proxy's own
+#                             default of "/userinfo", i.e. a nested OIDC userinfo claim). Set to "/"
+#                             to resolve pointers against the top-level claims of the bearer token
+#                             mcp-auth-proxy itself issues instead — do this when mapping a claim
+#                             (like "sub") that's always present at that top level, since some OIDC
+#                             flows don't reliably carry a nested "userinfo" claim onto that token.
 # OIDC_CLIENT_ID            — OIDC client id for mcp-auth-proxy (required, secret)
 # OIDC_CLIENT_SECRET        — OIDC client secret for mcp-auth-proxy (required, secret)
 # OIDC_CONFIGURATION_URL    — OIDC discovery document URL (required, secret)
@@ -133,6 +141,7 @@ services:
     image: ghcr.io/sigbit/mcp-auth-proxy:latest
     environment:
       - HEADER_MAPPING=${MCP_AUTH_PROXY_HEADER_MAPPING:-}
+      - HEADER_MAPPING_BASE=${MCP_AUTH_PROXY_HEADER_MAPPING_BASE:-}
     command:
       - "--external-url=https://${HOUTINI_LM_PUBLIC_HOST}"
       - "--no-auto-tls"
