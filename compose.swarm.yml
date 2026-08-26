@@ -24,6 +24,20 @@
 #                             an empty-string fallback (${VAR:-}), not a number baked into this
 #                             file — the one true default for each lives in src/index.ts, so this
 #                             file can never silently drift out of sync with it.
+# HOUTINI_LM_CONVERSATION_OWNER_HEADER — name of an HTTP request header carrying an authenticated
+#                             user identity (optional, default: unset = conversations are scoped to
+#                             the MCP session instead). Only set this if the front-end proxy in
+#                             front of this stack *replaces* any client-supplied header of the same
+#                             name rather than appending to it — an appending proxy would let a
+#                             client spoof another user's identity. This must name the same header
+#                             MCP_AUTH_PROXY_HEADER_MAPPING (below) is configured to set, or the
+#                             header this server looks for will never arrive.
+# MCP_AUTH_PROXY_HEADER_MAPPING — mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` equivalent:
+#                             a JSON-pointer-to-header-name mapping (e.g. "/sub:X-Forwarded-User")
+#                             that forwards an OIDC userinfo claim as the request header
+#                             HOUTINI_LM_CONVERSATION_OWNER_HEADER above expects (optional, default:
+#                             unset). Leave both of these two variables unset together; setting only
+#                             one has no effect.
 # OIDC_CLIENT_ID            — OIDC client id for mcp-auth-proxy (required, secret)
 # OIDC_CLIENT_SECRET        — OIDC client secret for mcp-auth-proxy (required, secret)
 # OIDC_CONFIGURATION_URL    — OIDC discovery document URL (required, secret)
@@ -86,6 +100,7 @@ services:
       - HOUTINI_LM_CONVERSATION_MAX=${HOUTINI_LM_CONVERSATION_MAX:-}
       - HOUTINI_LM_CONVERSATION_MAX_TURNS=${HOUTINI_LM_CONVERSATION_MAX_TURNS:-}
       - HOUTINI_LM_CONVERSATION_MAX_CHARS=${HOUTINI_LM_CONVERSATION_MAX_CHARS:-}
+      - HOUTINI_LM_CONVERSATION_OWNER_HEADER=${HOUTINI_LM_CONVERSATION_OWNER_HEADER:-}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
       - houtini-lm_shared:/mnt/houtini-lm-share:ro
@@ -116,6 +131,8 @@ services:
 
   mcp-auth-proxy:
     image: ghcr.io/sigbit/mcp-auth-proxy:latest
+    environment:
+      - HEADER_MAPPING=${MCP_AUTH_PROXY_HEADER_MAPPING:-}
     command:
       - "--external-url=https://${HOUTINI_LM_PUBLIC_HOST}"
       - "--no-auto-tls"

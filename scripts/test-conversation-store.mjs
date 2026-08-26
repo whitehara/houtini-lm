@@ -153,6 +153,42 @@ function makeClock(start) {
   eq('get() after delete → undefined', store.get(ownerA, id), undefined);
 }
 
+// --- owner-header mode (phase 11 phase 2): index.ts prefixes header-derived
+// owner keys with "hdr:" so they never collide with the session-ID key
+// space, but the store treats them as just another opaque owner string ---
+{
+  const store = new ConversationStore({ ttlMs: 60_000, maxConversations: 10, maxTurns: 40, maxChars: 48_000 });
+  const id = store.create('hdr:user-a@example.com');
+  store.append('hdr:user-a@example.com', id, [{ role: 'user', content: 'user-a secret' }]);
+  eq(
+    'opaque hdr: owner: get() from a different owner value → undefined',
+    store.get('hdr:user-b@example.com', id),
+    undefined,
+  );
+  ok(
+    'opaque hdr: owner: the conversation is still readable by its real owner',
+    store.get('hdr:user-a@example.com', id) !== undefined,
+  );
+}
+
+// --- makeKey() space-separated collision, using an "hdr:"-shaped owner —
+// the regression case for the multiplexed key space entry.owner !== owner
+// guards against (see the collision test above for the mechanism) ---
+{
+  const store = new ConversationStore({ ttlMs: 60_000, maxConversations: 10, maxTurns: 40, maxChars: 48_000 });
+  const id = store.create('hdr:a b'); // owner "hdr:a b", id <uuid>
+
+  // makeKey('hdr:a', `b ${id}`) === makeKey('hdr:a b', id) — same map key,
+  // different (owner, id) pair.
+  const collidingOwner = 'hdr:a';
+  const collidingId = `b ${id}`;
+  eq('hdr: space collision: get() with colliding key but wrong owner → undefined', store.get(collidingOwner, collidingId), undefined);
+  store.append(collidingOwner, collidingId, [{ role: 'user', content: 'should not land' }]);
+  eq('hdr: space collision: append() with colliding key but wrong owner is a no-op (real conversation still empty)', store.get('hdr:a b', id), []);
+  eq('hdr: space collision: delete() with colliding key but wrong owner → false', store.delete(collidingOwner, collidingId), false);
+  ok('hdr: space collision: the real conversation survives all colliding-key attempts', store.get('hdr:a b', id) !== undefined);
+}
+
 // --- list()/clear() are scoped to a single owner ---
 {
   const store = new ConversationStore({ ttlMs: 60_000, maxConversations: 10, maxTurns: 40, maxChars: 48_000 });

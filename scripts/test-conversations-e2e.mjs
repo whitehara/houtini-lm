@@ -25,28 +25,28 @@ function ok(name, cond, detail) {
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 /** Calls any delegation tool over an established MCP HTTP session and returns its response. */
-async function callTool(baseUrl, sessionId, toolName, args, id) {
+async function callTool(baseUrl, sessionId, toolName, args, id, extraHeaders = {}) {
   const res = await post(baseUrl, '/mcp', {
     jsonrpc: '2.0', id, method: 'tools/call',
     params: { name: toolName, arguments: args },
-  }, sessionId);
+  }, sessionId, extraHeaders);
   const result = res.messages.find((m) => m.id === id)?.result;
   return { httpStatus: res.status, result };
 }
 
 /** Calls the `chat` tool. Thin wrapper over callTool() so the existing phase-2 assertions are untouched. */
-async function callChat(baseUrl, sessionId, args, id) {
-  return callTool(baseUrl, sessionId, 'chat', args, id);
+async function callChat(baseUrl, sessionId, args, id, extraHeaders = {}) {
+  return callTool(baseUrl, sessionId, 'chat', args, id, extraHeaders);
 }
 
 /** Calls the `custom_prompt` tool. */
-async function callCustomPrompt(baseUrl, sessionId, args, id) {
-  return callTool(baseUrl, sessionId, 'custom_prompt', args, id);
+async function callCustomPrompt(baseUrl, sessionId, args, id, extraHeaders = {}) {
+  return callTool(baseUrl, sessionId, 'custom_prompt', args, id, extraHeaders);
 }
 
 /** Calls the `conversations` management tool (phase 9, phase 4). */
-async function callConversations(baseUrl, sessionId, args, id) {
-  return callTool(baseUrl, sessionId, 'conversations', args, id);
+async function callConversations(baseUrl, sessionId, args, id, extraHeaders = {}) {
+  return callTool(baseUrl, sessionId, 'conversations', args, id, extraHeaders);
 }
 
 /** Fetches tools/list and returns its result (the { tools: [...] } payload). */
@@ -401,6 +401,112 @@ async function main() {
   } finally {
     child2.kill();
     await backend2.close();
+  }
+
+  // === HOUTINI_LM_CONVERSATION_OWNER_HEADER e2e tests: a third server
+  // instance where the owner key comes from a request header instead of the
+  // MCP session id (phase 11, phase 2). OWNER_HEADER is the name this
+  // server is configured to look for; it is a test-only value and must
+  // never appear in compose/README/manual/CHANGELOG. ===
+  console.log('\n=== HOUTINI_LM_CONVERSATION_OWNER_HEADER E2E Tests ===\n');
+  const OWNER_HEADER = 'x-test-user';
+  // Marker line the completion-condition grep counts — one per scenario
+  // (a)-(f) below, emitted only when that scenario's assertions all passed.
+  function ownerHeaderPass(letter, description, allOk) {
+    if (allOk) process.stdout.write(`owner-header (${letter}) ${description}\n`);
+  }
+  const backend3 = await startFakeBackend();
+  const port3 = await getFreePort();
+  const { child: child3, ready: ready3 } = startServer(backend3.url, port3, { HOUTINI_LM_CONVERSATION_OWNER_HEADER: OWNER_HEADER });
+  const baseUrl3 = `http://127.0.0.1:${port3}`;
+  try {
+    await ready3;
+
+    // --- (a) same header value, different MCP session: continuation succeeds and the prior turn reaches the backend ---
+    let ownerHeaderConvId;
+    {
+      const before = failed;
+      const { sessionId: sessionA } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a' });
+      backend3.reset();
+      const { result: startResult } = await callChat(baseUrl3, sessionA, { message: 'owner-header first turn', max_tokens: 64, start_conversation: true }, 2, { [OWNER_HEADER]: 'user-a' });
+      ownerHeaderConvId = textOf(startResult).match(UUID_RE)?.[0];
+      ok('owner header a: start_conversation returns a UUID-shaped id', !!ownerHeaderConvId, textOf(startResult));
+
+      const { sessionId: sessionB } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a' });
+      backend3.reset();
+      const { result: continueResult } = await callChat(baseUrl3, sessionB, { message: 'owner-header second turn', max_tokens: 64, conversation_id: ownerHeaderConvId }, 2, { [OWNER_HEADER]: 'user-a' });
+      ok('owner header a: continuation from a different MCP session with the same header value is not isError', continueResult?.isError !== true, JSON.stringify(continueResult));
+      const sent = backend3.requests.at(-1)?.messages ?? [];
+      ok('owner header a: backend received 4 messages (prior turn threaded in)', sent.length === 4, JSON.stringify(sent));
+      ownerHeaderPass('a', 'same-user cross-session continuation succeeds, prior turn reaches the backend', failed === before);
+    }
+
+    // --- (b) different header value: continuation is isError ---
+    {
+      const before = failed;
+      const { sessionId: sessionC } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-b' });
+      backend3.reset();
+      const { result } = await callChat(baseUrl3, sessionC, { message: 'intruding', max_tokens: 64, conversation_id: ownerHeaderConvId }, 2, { [OWNER_HEADER]: 'user-b' });
+      ok('owner header b: continuation with a different header value is isError', result?.isError === true, JSON.stringify(result));
+      ok('owner header b: no request reached the backend', backend3.requests.length === 0, String(backend3.requests.length));
+      ownerHeaderPass('b', 'different header value on continuation is isError', failed === before);
+    }
+
+    // --- (c) no header at all: continuation is isError (fail closed, no session-ID fallback) ---
+    {
+      const before = failed;
+      const { sessionId: sessionD } = await initializeSession(baseUrl3, '/mcp');
+      backend3.reset();
+      const { result } = await callChat(baseUrl3, sessionD, { message: 'no header', max_tokens: 64, conversation_id: ownerHeaderConvId }, 2);
+      ok('owner header c: continuation with the header entirely absent is isError', result?.isError === true, JSON.stringify(result));
+      ok('owner header c: no request reached the backend', backend3.requests.length === 0, String(backend3.requests.length));
+      ownerHeaderPass('c', 'missing header on continuation is isError (no session-ID fallback)', failed === before);
+    }
+
+    // --- (d) list from a different MCP session, same header value, shows the other session's conversation id ---
+    {
+      const before = failed;
+      const { sessionId: sessionE } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a' });
+      const { result } = await callConversations(baseUrl3, sessionE, { action: 'list' }, 2, { [OWNER_HEADER]: 'user-a' });
+      const text = textOf(result);
+      ok('owner header d: list from a new session with the same header value includes the earlier session\'s conversation id', text.includes(ownerHeaderConvId), text);
+      ownerHeaderPass('d', 'list is shared across sessions for the same header value', failed === before);
+    }
+
+    // --- (e) MCP session DELETE does not discard the conversation when the owner header is set ---
+    {
+      const before = failed;
+      const { sessionId: sessionF } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a' });
+      backend3.reset();
+      const { result: startResult } = await callChat(baseUrl3, sessionF, { message: 'discard-on-delete probe', max_tokens: 64, start_conversation: true }, 2, { [OWNER_HEADER]: 'user-a' });
+      const deleteProbeId = textOf(startResult).match(UUID_RE)?.[0];
+      ok('owner header e: probe conversation started', !!deleteProbeId, textOf(startResult));
+
+      const delRes = await fetch(`${baseUrl3}/mcp`, { method: 'DELETE', headers: { 'mcp-session-id': sessionF } });
+      ok('owner header e: session DELETE succeeded', delRes.status === 200 || delRes.status === 204, String(delRes.status));
+
+      const { sessionId: sessionG } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a' });
+      backend3.reset();
+      const { result: continueResult } = await callChat(baseUrl3, sessionG, { message: 'after delete', max_tokens: 64, conversation_id: deleteProbeId }, 2, { [OWNER_HEADER]: 'user-a' });
+      ok('owner header e: continuation still succeeds after the creating MCP session was DELETEd', continueResult?.isError !== true, JSON.stringify(continueResult));
+      ownerHeaderPass('e', 'conversation survives MCP session DELETE in header-owner mode', failed === before);
+    }
+
+    // --- (f) duplicated/comma-joined header value: rejected, not silently split or averaged ---
+    {
+      const before = failed;
+      const { sessionId: sessionH } = await initializeSession(baseUrl3, '/mcp', { [OWNER_HEADER]: 'user-a, user-b' });
+      backend3.reset();
+      const { result } = await callChat(baseUrl3, sessionH, { message: 'duplicated header', max_tokens: 64, start_conversation: true }, 2, { [OWNER_HEADER]: 'user-a, user-b' });
+      ok('owner header f: a comma-joined (duplicated) header value is isError', result?.isError === true, JSON.stringify(result));
+      ok('owner header f: no request reached the backend', backend3.requests.length === 0, String(backend3.requests.length));
+      ownerHeaderPass('f', 'comma-joined header value is rejected outright', failed === before);
+    }
+
+    console.log(failed ? `\n${failed} FAILED\n` : '\nAll owner-header e2e tests passed\n');
+  } finally {
+    child3.kill();
+    await backend3.close();
   }
 
   process.exitCode = failed ? 1 : 0;

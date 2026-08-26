@@ -81,9 +81,9 @@ The 💰 line is cumulative Claude quota kept in your pocket. It climbs quickly 
 
 ## conversations
 
-Housekeeping for the server-side conversations `chat` and `custom_prompt` can start with `start_conversation: true` - see [Server-side conversations](../README.md#server-side-conversations) in the README for how those work. This tool never shows or touches anything outside the calling MCP connection.
+Housekeeping for the server-side conversations `chat` and `custom_prompt` can start with `start_conversation: true` - see [Server-side conversations](../README.md#server-side-conversations) in the README for how those work, including its two ownership modes. This tool never shows or touches anything you don't own.
 
-Three actions, chosen with the `action` parameter: `list` returns a table of this connection's conversations - id, turn count, chars retained, idle time, expiry - metadata only, never message content. `delete` removes one by `conversation_id`; an id that never existed and one that belongs to a different connection get the identical error, on purpose, so the error can't be used to probe for other connections' ids. `clear` removes everything on this connection at once, with no confirmation step - call `list` first if you want to know what you're about to lose.
+Three actions, chosen with the `action` parameter: `list` returns a table of your conversations - id, turn count, chars retained, idle time, expiry - metadata only, never message content. `delete` removes one by `conversation_id`; an id that never existed and one owned by someone else get the identical error, on purpose, so the error can't be used to probe for other owners' ids. `clear` removes everything you own at once, with no confirmation step - call `list` first if you want to know what you're about to lose.
 
 Not in the tool list at all if the server's running with `HOUTINI_LM_CONVERSATIONS=0`.
 
