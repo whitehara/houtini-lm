@@ -7,14 +7,32 @@
 # HOUTINI_LM_PUBLIC_HOST    — public hostname this stack is reached at (required)
 # HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://ollama.com)
 # HOUTINI_LM_API_KEY        — backend API key, e.g. Ollama Cloud key (required, secret)
-# HOUTINI_LM_FILE_ROOTS     — code_task_files allow-list; point at a non-existent path to seal it off remotely (optional, default: sealed)
+# HOUTINI_LM_FILE_ROOTS     — code_task_files allow-list; defaults to the houtini-lm_shared
+#                             NFS mount below so remote clients can hand files to code_task_files
+#                             by writing into that shared tree. Point at a non-existent path to
+#                             seal file access off remotely instead (optional, default: shared mount)
 # HOUTINI_LM_SERIALISE      — serialise concurrent inference calls, 0/1 (optional, default: 0 — no benefit against a cloud backend)
 # HOUTINI_LM_CROSS_PROCESS_LOCK — cross-process inference lock, 0/1 (optional, default: 0)
 # OIDC_CLIENT_ID            — OIDC client id for mcp-auth-proxy (required, secret)
 # OIDC_CLIENT_SECRET        — OIDC client secret for mcp-auth-proxy (required, secret)
 # OIDC_CONFIGURATION_URL    — OIDC discovery document URL (required, secret)
-# OIDC_ALLOWED_USERS_GLOB   — glob restricting which authenticated users may connect (optional, default: unrestricted)
-# NFS_SERVER_ADDR           — hostname/IP of the NFS server backing houtini-lm_auth_data (required, homelab-specific)
+# OIDC_ALLOWED_USERS_GLOB   — glob restricting which authenticated users may connect (optional, default: unrestricted).
+#                             With HOUTINI_LM_FILE_ROOTS pointed at a shared mount, every
+#                             authenticated user allowed through this glob can read that mount's
+#                             contents via code_task_files — keep this glob scoped accordingly.
+# NFS_SERVER_ADDR           — hostname/IP of the NFS server backing houtini-lm_auth_data and houtini-lm_shared (required, homelab-specific)
+#
+# code_task_files file sharing: HOUTINI_LM_FILE_ROOTS below defaults to /mnt/houtini-lm-share,
+# which the houtini-lm_shared volume mounts read-only into the container. This requires an NFS
+# export at NFS_SERVER_ADDR:/docker-volumes/houtini-lm_shared to already exist — if it doesn't,
+# the houtini-lm task will fail to start. Clients pass code_task_files the same absolute path
+# (/mnt/houtini-lm-share/...) that they used to write the file, so they must mount the same NFS
+# export at that same path themselves. Defense against opening this up is layered: (1) the mount
+# below is read-only, so the container can only read the shared tree, never write to it; (2)
+# HOUTINI_LM_FILE_ROOTS confines code_task_files to that tree and nothing else; (3)
+# OIDC_ALLOWED_USERS_GLOB above controls who can reach code_task_files at all. All three need to
+# hold for this to be safe — do not drop the :ro flag or widen HOUTINI_LM_FILE_ROOTS without
+# reconsidering (2), and do not loosen the glob without reconsidering (3).
 
 volumes:
   houtini-lm-state:
@@ -24,6 +42,12 @@ volumes:
       type: nfs
       o: "addr=${NFS_SERVER_ADDR},hard,nfsvers=4.2,nconnect=4,noresvport"
       device: ":/docker-volumes/houtini-lm_auth_data"
+  houtini-lm_shared:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER_ADDR},hard,nfsvers=4.2,nconnect=4,noresvport,actimeo=1"
+      device: ":/docker-volumes/houtini-lm_shared"
 
 networks:
   internal-net:
@@ -43,11 +67,12 @@ services:
       - HOUTINI_LM_HTTP_PATH=/
       - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://ollama.com}
       - HOUTINI_LM_API_KEY=${HOUTINI_LM_API_KEY:-}
-      - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/home/node/.houtini-lm/no-files}
+      - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/mnt/houtini-lm-share}
       - HOUTINI_LM_SERIALISE=${HOUTINI_LM_SERIALISE:-0}
       - HOUTINI_LM_CROSS_PROCESS_LOCK=${HOUTINI_LM_CROSS_PROCESS_LOCK:-0}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
+      - houtini-lm_shared:/mnt/houtini-lm-share:ro
     networks:
       - internal-net
     healthcheck:
