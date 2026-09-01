@@ -15,6 +15,7 @@
     "test:thinking-mode": "node scripts/test-thinking-mode.mjs",
     "test:conversations": "node scripts/test-conversation-store.mjs",
     "test:jobs": "node scripts/test-job-store.mjs",
+    "test:jobs:e2e": "node scripts/test-jobs-e2e.mjs",
     "test:conversations:e2e": "node scripts/test-conversations-e2e.mjs",
     "test:conversations:stdio": "node scripts/test-conversations-stdio-e2e.mjs",
     "test:progress": "node scripts/test-progress-notifications.mjs",
