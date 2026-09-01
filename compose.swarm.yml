@@ -5,8 +5,13 @@
 # never committed here):
 # HOUTINI_LM_IMAGE_TAG      — GHCR image tag to deploy (optional, default: latest)
 # HOUTINI_LM_PUBLIC_HOST    — public hostname this stack is reached at (required)
-# HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://ollama.com)
-# HOUTINI_LM_API_KEY        — backend API key, e.g. Ollama Cloud key (required, secret)
+# HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://openrouter.ai/api)
+# HOUTINI_LM_API_KEY        — backend API key for the configured provider (required, secret)
+# HOUTINI_LM_MODEL          — default model id to pin (optional, default: unset = auto-route). Leaving
+#                             this unset on a large-catalogue backend like OpenRouter (300+ models,
+#                             all reporting as routable) makes auto-routing pick whichever model
+#                             happens to sort first in that backend's catalogue, which can change
+#                             without warning — pin this explicitly on such backends.
 # HOUTINI_LM_FILE_ROOTS     — code_task_files allow-list; defaults to the houtini-lm_shared
 #                             NFS mount below so remote clients can hand files to code_task_files
 #                             by writing into that shared tree. Point at a non-existent path to
@@ -31,7 +36,22 @@
 #                             name rather than appending to it — an appending proxy would let a
 #                             client spoof another user's identity. This must name the same header
 #                             MCP_AUTH_PROXY_HEADER_MAPPING (below) is configured to set, or the
-#                             header this server looks for will never arrive.
+#                             header this server looks for will never arrive. Also governs who owns
+#                             an async job below — jobs and conversations share this one setting.
+# HOUTINI_LM_JOBS                — enable/disable async jobs (async: true on custom_prompt/
+#                             code_task_files, plus the jobs tool), 1/0 (optional, default: 1).
+#                             Doubles as a production kill switch: set to 0 and redeploy to fall
+#                             back to fully synchronous behaviour without rolling back the image.
+# HOUTINI_LM_JOB_TTL_MIN          — job-record idle-expiry window in minutes, from submission (optional, default: 60)
+# HOUTINI_LM_JOB_MAX               — max job records held at once, across all owners (optional, default: 50)
+# HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER — max pending/running jobs a single owner may have at once (optional, default: 2)
+# HOUTINI_LM_JOB_CONCURRENCY       — max jobs actually running inference at once, across all owners (optional, default: 1)
+# HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN  — per-job soft timeout in minutes (optional, default: 15)
+# HOUTINI_LM_JOB_MAX_RESULT_CHARS  — max characters kept for a completed job's result (optional, default: 200000)
+#                             Like the conversation variables above, these seven are passed through
+#                             below with an empty-string fallback (${VAR:-}) rather than a number
+#                             baked into this file — the one true default for each lives in
+#                             src/index.ts, so this file can never silently drift out of sync with it.
 # MCP_AUTH_PROXY_HEADER_MAPPING — mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` equivalent:
 #                             a JSON-pointer-to-header-name mapping (e.g. "/sub:X-Forwarded-User")
 #                             that forwards an OIDC claim as the request header
@@ -98,8 +118,9 @@ services:
       # not correctly resolve OAuth protected-resource metadata or token
       # resource/audience for a non-root backend path.
       - HOUTINI_LM_HTTP_PATH=/
-      - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://ollama.com}
+      - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://openrouter.ai/api}
       - HOUTINI_LM_API_KEY=${HOUTINI_LM_API_KEY:-}
+      - HOUTINI_LM_MODEL=${HOUTINI_LM_MODEL:-}
       - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/mnt/houtini-lm-share}
       - HOUTINI_LM_SERIALISE=${HOUTINI_LM_SERIALISE:-0}
       - HOUTINI_LM_CROSS_PROCESS_LOCK=${HOUTINI_LM_CROSS_PROCESS_LOCK:-0}
@@ -109,6 +130,13 @@ services:
       - HOUTINI_LM_CONVERSATION_MAX_TURNS=${HOUTINI_LM_CONVERSATION_MAX_TURNS:-}
       - HOUTINI_LM_CONVERSATION_MAX_CHARS=${HOUTINI_LM_CONVERSATION_MAX_CHARS:-}
       - HOUTINI_LM_CONVERSATION_OWNER_HEADER=${HOUTINI_LM_CONVERSATION_OWNER_HEADER:-}
+      - HOUTINI_LM_JOBS=${HOUTINI_LM_JOBS:-}
+      - HOUTINI_LM_JOB_TTL_MIN=${HOUTINI_LM_JOB_TTL_MIN:-}
+      - HOUTINI_LM_JOB_MAX=${HOUTINI_LM_JOB_MAX:-}
+      - HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER=${HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER:-}
+      - HOUTINI_LM_JOB_CONCURRENCY=${HOUTINI_LM_JOB_CONCURRENCY:-}
+      - HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN=${HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN:-}
+      - HOUTINI_LM_JOB_MAX_RESULT_CHARS=${HOUTINI_LM_JOB_MAX_RESULT_CHARS:-}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
       - houtini-lm_shared:/mnt/houtini-lm-share:ro
@@ -122,10 +150,12 @@ services:
       start_period: 10s
     deploy:
       mode: replicated
-      # Server-side conversations live in memory, per process, not shared
-      # across replicas — raising this above 1 would let a client's calls
-      # land on a different replica mid-conversation and silently lose its
-      # history. Keep this at 1 (or set HOUTINI_LM_CONVERSATIONS=0 first).
+      # Server-side conversations AND async jobs both live in memory, per
+      # process, not shared across replicas — raising this above 1 would
+      # let a client's calls land on a different replica mid-conversation
+      # (silently losing its history) or land a jobs poll on a replica
+      # that never saw the job it's asking about. Keep this at 1 (or set
+      # HOUTINI_LM_CONVERSATIONS=0 and HOUTINI_LM_JOBS=0 first).
       replicas: 1
       restart_policy:
         condition: any

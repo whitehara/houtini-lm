@@ -1,6 +1,6 @@
 # The tools, in depth
 
-Nine tools. Five do inference, three tell you about the setup, and one manages server-side conversations. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
+Ten tools. Five do inference, three tell you about the setup, one manages server-side conversations, and one manages background jobs. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
 
 ## chat
 
@@ -38,6 +38,8 @@ Also accepts `include_reasoning` and `force_thinking` (both default `false`) - s
 
 When you're continuing a conversation, `context` gets special treatment: it's only recorded into the stored history the first time you send it for that `conversation_id`, so resending the same block on every call is safe and won't duplicate it. That's the recommended habit, in fact - if a long conversation ever trims `context` out of its retained history, resending it puts it straight back.
 
+Also accepts `async` (default `false`) - submit as a background job instead of waiting inline; see [Async jobs](../README.md#async-jobs) in the README. Cannot be combined with `start_conversation`/`conversation_id`.
+
 ## code_task
 
 `chat` wrapped in a code-review system prompt with temperature locked low (0.2, or the routed model's own hint). Two required fields - `code` and `task` - plus an optional `language` that shapes the system prompt and measurably improves accuracy. Set it.
@@ -57,7 +59,7 @@ The one that changes the economics. Same pipeline as `code_task`, but you pass *
 
 Two env vars scope it: `HOUTINI_LM_FILE_ROOTS` confines reads to an allowlist of directories (symlink-resolved), and `HOUTINI_LM_MAX_FILE_MB` caps per-file size (default 10).
 
-Also accepts `include_reasoning` and `force_thinking` (both default `false`) - same as `chat`.
+Also accepts `include_reasoning` and `force_thinking` (both default `false`) - same as `chat` - plus `async` (default `false`): submit as a background job instead of waiting inline. Paths are still read and validated *before* the call returns, whether or not `async` is set - a bad path fails synchronously either way. See [Async jobs](../README.md#async-jobs) in the README.
 
 ## embed
 
@@ -86,6 +88,14 @@ Housekeeping for the server-side conversations `chat` and `custom_prompt` can st
 Three actions, chosen with the `action` parameter: `list` returns a table of your conversations - id, turn count, chars retained, idle time, expiry - metadata only, never message content. `delete` removes one by `conversation_id`; an id that never existed and one owned by someone else get the identical error, on purpose, so the error can't be used to probe for other owners' ids. `clear` removes everything you own at once, with no confirmation step - call `list` first if you want to know what you're about to lose.
 
 Not in the tool list at all if the server's running with `HOUTINI_LM_CONVERSATIONS=0`.
+
+## jobs
+
+Housekeeping for the background jobs `custom_prompt` and `code_task_files` can start with `async: true` - see [Async jobs](../README.md#async-jobs) in the README for how those work, including the same ownership boundary `conversations` uses. This tool never shows or touches anything you don't own.
+
+Three actions, chosen with the `action` parameter: `list` returns a table of your jobs - id, tool, state, submitted time - metadata only, never the result body. `get` (needs `job_id`) returns the full state, and once `completed` or `failed`, the result or error itself; pass `wait_ms` (up to 30,000) to block for the job to finish instead of polling in a tight loop. `delete` (needs `job_id`) forgets the record - it does not cancel a `running` job, which keeps executing against the backend regardless.
+
+Not in the tool list at all if the server's running with `HOUTINI_LM_JOBS=0`.
 
 ## Reading the footer
 

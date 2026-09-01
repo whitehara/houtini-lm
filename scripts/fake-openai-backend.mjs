@@ -6,12 +6,20 @@
  */
 import { createServer } from 'node:http';
 
-export function startFakeBackend({ port = 0 } = {}) {
+export function startFakeBackend({ port = 0, firstChunkDelayMs = 0 } = {}) {
   // Every parsed /v1/chat/completions request body, in arrival order — lets
   // callers assert on what houtini-lm actually sent upstream (e.g. that a
   // conversation's stored history was prepended to `messages`). reset()
   // clears it between test cases without needing a fresh server instance.
   const requests = [];
+  // Delay (ms) before the FIRST streamed chunk is written, applied on every
+  // streaming request until changed. Lets a test simulate slow prefill
+  // (e.g. to exercise a job's longer prefill timeout, or to keep two jobs
+  // "running" long enough to assert on HOUTINI_LM_JOB_CONCURRENCY) without a
+  // real backend. 0 (default) reproduces the original no-delay behaviour
+  // exactly. Mutable via the returned `setFirstChunkDelayMs()` so a single
+  // backend instance can vary it between test cases.
+  let currentFirstChunkDelayMs = firstChunkDelayMs;
 
   const server = createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
@@ -67,7 +75,10 @@ export function startFakeBackend({ port = 0 } = {}) {
             i++;
             setTimeout(sendNext, 200);
           };
-          sendNext();
+          // Only the FIRST chunk is delayed by currentFirstChunkDelayMs — the
+          // rest of the stream keeps its normal 200ms cadence. 0 (default)
+          // starts immediately, identical to the pre-existing behaviour.
+          setTimeout(sendNext, currentFirstChunkDelayMs);
           return;
         }
 
@@ -100,6 +111,7 @@ export function startFakeBackend({ port = 0 } = {}) {
         close: () => new Promise((res2) => server.close(() => res2())),
         requests,
         reset: () => { requests.length = 0; },
+        setFirstChunkDelayMs: (ms) => { currentFirstChunkDelayMs = ms; },
       });
     });
   });
