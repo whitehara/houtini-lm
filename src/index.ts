@@ -51,6 +51,7 @@ import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js'
 import { formatReasoningBlock } from './reasoning-block.js';
 import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.js';
 import { ConversationStore, formatConversationLine, formatConversationList, type ConversationTurn } from './conversation-store.js';
+import { JobStore, formatJobSubmitted, formatJobStatus, formatJobList, type JobTool, type JobRecord } from './job-store.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -443,6 +444,140 @@ const conversations = new ConversationStore({
   maxTurns: CONVERSATION_MAX_TURNS,
   maxChars: CONVERSATION_MAX_CHARS,
 });
+
+// ── Async job execution (custom_prompt / code_task_files only) ────────
+// Phase 13: `async: true` submits the call as a background job instead of
+// running it inline. See job-store.ts's header for the storage model and
+// multi-tenant safety story; this section owns env config, the JobStore
+// instance, and the runner (submitJob/pump/runJob) that drains it. Wired
+// into custom_prompt and code_task_files only — chat and code_task are
+// untouched by phase 13.
+//
+// Default on: HOUTINI_LM_JOBS=0 (or false/no/off) disables the feature
+// entirely — the `jobs` tool is hidden from tools/list (see the conditional
+// spread in TOOLS below) and `async: true` becomes a hard error instead of
+// being silently ignored.
+const JOBS_ENABLED = !/^(0|false|no|off)$/i.test(process.env.HOUTINI_LM_JOBS || '');
+const JOB_TTL_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_TTL_MIN || '60', 10) || 60);
+const JOB_MAX = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_MAX || '50', 10) || 50);
+const JOB_ACTIVE_MAX_PER_OWNER = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER || '2', 10) || 2);
+const JOB_CONCURRENCY = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_CONCURRENCY || '1', 10) || 1);
+const JOB_SOFT_TIMEOUT_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN || '15', 10) || 15);
+// Not one of phase 13's headline 6 env vars, but added for the same reason
+// HOUTINI_LM_CONVERSATION_MAX_CHARS exists for ConversationStore: a
+// completed job's result is the same text a synchronous call would have
+// returned, so 200K is generous headroom for real use, but tests (see
+// scripts/test-jobs-e2e.mjs's truncation case) need a much smaller ceiling
+// to exercise truncation without generating a 200K-char fake response.
+const JOB_MAX_RESULT_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_MAX_RESULT_CHARS || '200000', 10) || 200_000);
+
+const jobs = new JobStore({
+  ttlMs: JOB_TTL_MIN * 60_000,
+  maxJobs: JOB_MAX,
+  maxResultChars: JOB_MAX_RESULT_CHARS,
+});
+
+// Job-scoped chatCompletionStreaming timeouts — longer than the interactive
+// defaults (SOFT_TIMEOUT_MS/PREFILL_TIMEOUT_MS above) because a job has no
+// MCP client watching a request timeout; it can afford to wait out a slow
+// prefill or a long generation instead of truncating early.
+const JOB_SOFT_TIMEOUT_MS = JOB_SOFT_TIMEOUT_MIN * 60_000;
+const JOB_PREFILL_TIMEOUT_MS = JOB_SOFT_TIMEOUT_MS;
+// A job never has an MCP progress channel to keep a client's request alive
+// (see runJob below), so chatCompletionStreamingInner's fail-open default
+// for the cross-process lock (45s — see canKeepalive at that call site)
+// would apply and let two jobs drive the model in parallel. Give the lock
+// the job's full soft-timeout budget instead.
+//
+// STALE_MS in inference-lock.ts is 7 minutes — less than
+// JOB_SOFT_TIMEOUT_MIN's default of 15. A long-running job's cross-process
+// lock CAN therefore be stolen by another process before the job finishes,
+// degrading cross-process serialisation for that job to best-effort. This is
+// accepted, not an oversight: acquireInferenceLock()'s whole contract is
+// fail-open/best-effort (see that module's header — "serialisation is a
+// throughput optimisation, never a correctness dependency"), and lowering
+// STALE_MS to accommodate jobs would risk prematurely stealing a genuinely
+// slow *interactive* call elsewhere. Same-process serialisation
+// (withInferenceLock, inside chatCompletionStreaming itself) remains a hard
+// guarantee for jobs regardless — only the cross-process layer degrades.
+const JOB_LOCK_MAX_WAIT_MS = JOB_SOFT_TIMEOUT_MS;
+
+// Job execution functions, keyed by job id. JobStore (job-store.ts) tracks
+// only state + result/error — the actual () => Promise<string> to run is a
+// runner-only concern that lives here. Removed as soon as pump() claims a
+// job (see below), so a fn can never leak or run twice.
+const jobFns = new Map<string, () => Promise<string>>();
+let jobsRunning = 0;
+
+/**
+ * Create a job record and register its execution function, then kick the
+ * queue. Returns the new job id immediately — actual execution happens
+ * later, drained by pump()/runJob() below.
+ */
+function submitJob(owner: string, tool: JobTool, fn: () => Promise<string>): string {
+  const id = jobs.create(owner, tool);
+  jobFns.set(id, fn);
+  process.stderr.write(`[houtini-lm] job ${id} (${tool}) submitted\n`);
+  pump();
+  return id;
+}
+
+/**
+ * Claim and start pending jobs up to HOUTINI_LM_JOB_CONCURRENCY. Called from
+ * exactly two places — submitJob() right after a new job is queued, and
+ * runJob()'s `finally` right after a job finishes — no timer drives this, by
+ * design (see phase 13's plan).
+ */
+function pump(): void {
+  while (jobsRunning < JOB_CONCURRENCY) {
+    const record = jobs.takeNextPending();
+    if (!record) return;
+    const fn = jobFns.get(record.id);
+    jobFns.delete(record.id);
+    if (!fn) {
+      // Unreachable in practice — every pending job got its fn registered by
+      // submitJob() before takeNextPending() could ever see it. Defensive
+      // only: fail it outright rather than leave it wedged in `running`
+      // forever with nothing to execute, and keep pumping.
+      jobs.markFailed(record.id, 'internal error: job function missing');
+      continue;
+    }
+    jobsRunning++;
+    process.stderr.write(`[houtini-lm] job ${record.id} (${record.tool}) started\n`);
+    void runJob(record, fn);
+  }
+}
+
+/**
+ * Run one job to completion. try/catch/finally is UNCONDITIONAL — an
+ * uncaught rejection from fn() would otherwise be an unhandled promise
+ * rejection at the process level, killing the whole server (Node's default
+ * behaviour) and taking every other in-flight request down with it. A single
+ * job's failure must never do that.
+ *
+ * Deliberately does NOT wrap fn() in withInferenceLock()/acquireInferenceLock()
+ * — fn() is expected to call chatCompletionStreaming() itself, which already
+ * takes the in-process semaphore internally (see withInferenceLock at that
+ * function's definition, above). The semaphore is not reentrant: wrapping
+ * this call in another withInferenceLock would deadlock the moment fn()'s
+ * own chatCompletionStreaming() call tried to acquire it a second time from
+ * inside the first acquisition. Found via plan-deep-check's Fable review
+ * before any of this shipped — see phase13-async-jobs.md.
+ */
+async function runJob(record: JobRecord, fn: () => Promise<string>): Promise<void> {
+  const startedAt = Date.now();
+  try {
+    const result = await fn();
+    jobs.markCompleted(record.id, result);
+    process.stderr.write(`[houtini-lm] job ${record.id} completed in ${Date.now() - startedAt}ms (${result.length} chars)\n`);
+  } catch (err) {
+    jobs.markFailed(record.id, err instanceof Error ? err.message : String(err));
+    process.stderr.write(`[houtini-lm] job ${record.id} failed after ${Date.now() - startedAt}ms\n`);
+  } finally {
+    jobsRunning--;
+    pump();
+  }
+}
 
 // ── OpenAI-compatible API helpers ────────────────────────────────────
 
@@ -906,6 +1041,17 @@ interface InferenceOptions {
    * since StdioServerTransport.send() ignores the routing options entirely.
    */
   sendNotification?: ProgressNotifier;
+  /**
+   * Overrides for SOFT_TIMEOUT_MS / PREFILL_TIMEOUT_MS / acquireInferenceLock's
+   * maxWaitMs, all undefined by default — omitting them reproduces today's
+   * behaviour exactly. Added for async job execution (phase 13): a job has no
+   * MCP client watching a request timeout and no progressToken to keep one
+   * alive, so it needs longer budgets than an interactive call. See the
+   * "Async job execution" section for the values jobs actually pass.
+   */
+  softTimeoutMs?: number;
+  prefillTimeoutMs?: number;
+  lockMaxWaitMs?: number;
 }
 
 /**
@@ -1248,8 +1394,11 @@ async function chatCompletionStreamingInner(
           : undefined,
         // Without a progressToken we can't keep the client alive during a long
         // wait, so fail open well before the typical ~60s client request timeout
-        // rather than sit silent in the queue and get aborted.
-        maxWaitMs: canKeepalive ? undefined : 45_000,
+        // rather than sit silent in the queue and get aborted. options.lockMaxWaitMs
+        // overrides this — async jobs (phase 13) have no progressToken either but
+        // also no client timeout to protect, so they pass a much longer budget
+        // instead of falling into this 45s default.
+        maxWaitMs: options.lockMaxWaitMs ?? (canKeepalive ? undefined : 45_000),
       })
     : () => { /* parallel-friendly backend (e.g. OpenRouter) */ };
 
@@ -1346,11 +1495,17 @@ async function chatCompletionStreamingInner(
     sendProgress(`Waiting for model... (${(waitedMs / 1000).toFixed(0)}s, still in prefill)`);
   }, PREFILL_KEEPALIVE_MS);
 
+  // options.softTimeoutMs/prefillTimeoutMs override the interactive defaults
+  // (see InferenceOptions) — undefined by default, reproducing today's
+  // behaviour exactly. Async jobs (phase 13) pass job-scoped values instead.
+  const effectiveSoftTimeoutMs = options.softTimeoutMs ?? SOFT_TIMEOUT_MS;
+  const effectivePrefillTimeoutMs = options.prefillTimeoutMs ?? PREFILL_TIMEOUT_MS;
+
   try {
     while (true) {
       // Check soft timeout before each read
       const elapsed = Date.now() - startTime;
-      if (elapsed > SOFT_TIMEOUT_MS) {
+      if (elapsed > effectiveSoftTimeoutMs) {
         truncated = true;
         process.stderr.write(`[houtini-lm] Soft timeout at ${elapsed}ms, returning ${content.length} chars of partial content\n`);
         break;
@@ -1359,8 +1514,8 @@ async function chatCompletionStreamingInner(
       // Split prefill vs mid-stream timeouts. Prefill on slow hardware with
       // a 7k-token input can legitimately take 1-2 min; mid-stream stalls
       // should surface much faster. Track firstChunkReceived to switch.
-      const remaining = SOFT_TIMEOUT_MS - elapsed;
-      const perChunkCeiling = firstChunkReceived ? READ_CHUNK_TIMEOUT_MS : PREFILL_TIMEOUT_MS;
+      const remaining = effectiveSoftTimeoutMs - elapsed;
+      const perChunkCeiling = firstChunkReceived ? READ_CHUNK_TIMEOUT_MS : effectivePrefillTimeoutMs;
       const chunkTimeout = Math.min(perChunkCeiling, remaining);
       const result = await timedRead(reader, chunkTimeout);
 
@@ -2148,43 +2303,51 @@ type ConversationContext =
 // at all — one literal, so the wording can never drift between them.
 const CONVERSATIONS_DISABLED_MESSAGE = 'Error: server-side conversations are disabled on this houtini-lm instance.';
 
-// Result of resolveConversationOwner() below: either the owner key this
-// caller is scoped to, or the isError result to return unchanged because
-// no owner could be resolved (HTTP with no MCP session — see the function
-// for why this never falls back to a shared key).
+// Result of resolveConversationOwner()/resolveJobOwner() below: either the
+// owner key this caller is scoped to, or the isError result to return
+// unchanged because no owner could be resolved (HTTP with no MCP session —
+// see resolveOwnerKey() for why this never falls back to a shared key).
 type ConversationOwner = { kind: 'owner'; owner: string } | { kind: 'error'; result: CallToolResult };
 
-// resolveConversationOwner()'s header-mode branch logs "not usable" to
-// stderr at most once per process (see that branch below) — this flag is
-// the suppression latch. Best-effort only: it's read and written by
-// synchronous code with no `await` between the check and the set, so under
-// Node's single-threaded event loop it cannot race within one call; a
-// duplicate line across calls would be harmless anyway, so no lock is used.
+// Result of resolveOwnerKey() below — the reason-code-only core that
+// resolveConversationOwner() and resolveJobOwner() each turn into their own
+// feature-appropriate CallToolResult error text.
+type OwnerKeyResult = { kind: 'owner'; owner: string } | { kind: 'error'; reason: 'header-unusable' | 'no-session' };
+
+// resolveOwnerKey()'s header-mode branch logs "not usable" to stderr at most
+// once per process (see that branch below) — this flag is the suppression
+// latch. Best-effort only: it's read and written by synchronous code with no
+// `await` between the check and the set, so under Node's single-threaded
+// event loop it cannot race within one call; a duplicate line across calls
+// would be harmless anyway, so no lock is used.
 let ownerHeaderWarned = false;
 
 /**
- * Resolve the caller's conversation owner key. This is the multi-tenant
- * safety boundary for server-side conversations — see conversation-store.ts's
- * header comment for why owner scoping exists at all — so resolveConversation()
- * (chat/custom_prompt) and the conversations management tool both fold
- * through this single function rather than each deriving the owner key
- * independently. Two copies of this logic drifting apart (e.g. one
- * forgetting the "never fall back to a fixed key over HTTP" rule) would be
- * a cross-tenant history leak, not a cosmetic bug.
+ * Resolve the caller's owner key — the multi-tenant safety boundary shared
+ * by server-side conversations (conversation-store.ts) AND async jobs
+ * (job-store.ts, phase 13). resolveConversationOwner() (chat/custom_prompt/
+ * conversations) and resolveJobOwner() (custom_prompt/code_task_files/jobs,
+ * phase 13) both fold through this single function rather than each
+ * deriving the owner key independently. Two copies of this logic drifting
+ * apart (e.g. one forgetting the "never fall back to a fixed key over HTTP"
+ * rule) would be a cross-tenant leak in whichever feature copied it wrong,
+ * not a cosmetic bug.
  *
  * Two resolution modes, selected once at startup by whether
- * HOUTINI_LM_CONVERSATION_OWNER_HEADER is set:
+ * HOUTINI_LM_CONVERSATION_OWNER_HEADER is set (the env var name predates
+ * jobs — phase 13 reuses it rather than introducing a second, since both
+ * features need the exact same identity boundary):
  *  - Unset (default): the owner key is the MCP session ID (stdio → the
  *    fixed key "stdio-local"; HTTP → extra.sessionId). This scopes
- *    conversations to one MCP connection.
+ *    conversations/jobs to one MCP connection.
  *  - Set: the owner key is the value of the named HTTP request header — a
  *    caller identity a front-end proxy is expected to attach after its own
- *    authentication. This scopes conversations to that identity across MCP
- *    sessions/connections instead. Neither mode ever falls back to the
+ *    authentication. This scopes conversations/jobs to that identity across
+ *    MCP sessions/connections instead. Neither mode ever falls back to the
  *    other's key on failure — see the header branch below for why that
  *    would defeat the point.
  */
-function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
+function resolveOwnerKey(extra: HoutiniExtra): OwnerKeyResult {
   // HOUTINI_LM_TRANSPORT is fixed for the whole process, so it's a reliable
   // way to know which resolution applies; never fall back to a fixed key
   // over HTTP, or two different callers could share history.
@@ -2216,33 +2379,42 @@ function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
         ownerHeaderWarned = true;
         const seen = Object.keys(extra.requestInfo?.headers ?? {}).join(', ');
         process.stderr.write(
-          `[houtini-lm] conversation owner header "${CONVERSATION_OWNER_HEADER}" not usable; headers seen: ${seen}\n`,
+          `[houtini-lm] owner header "${CONVERSATION_OWNER_HEADER}" not usable; headers seen: ${seen}\n`,
         );
       }
-      return {
-        kind: 'error',
-        result: {
-          content: [{ type: 'text', text: 'Error: server-side conversations require an authenticated user header on this server.' }],
-          isError: true,
-        },
-      };
+      return { kind: 'error', reason: 'header-unusable' };
     }
     // "hdr:" separates this mode's key space from the session-ID mode's key
-    // space (owner strings are opaque to ConversationStore either way, so
-    // this is purely a namespacing convention, not a security boundary).
+    // space (owner strings are opaque to ConversationStore/JobStore either
+    // way, so this is purely a namespacing convention, not a security
+    // boundary).
     return { kind: 'owner', owner: `hdr:${raw.trim()}` };
   }
 
   if (extra.sessionId === undefined) {
-    return {
-      kind: 'error',
-      result: {
-        content: [{ type: 'text', text: 'Error: server-side conversations require an MCP session.' }],
-        isError: true,
-      },
-    };
+    return { kind: 'error', reason: 'no-session' };
   }
   return { kind: 'owner', owner: extra.sessionId };
+}
+
+/** resolveOwnerKey() wrapper for server-side conversations — see that function for the shared resolution logic. */
+function resolveConversationOwner(extra: HoutiniExtra): ConversationOwner {
+  const r = resolveOwnerKey(extra);
+  if (r.kind === 'owner') return r;
+  const text = r.reason === 'header-unusable'
+    ? 'Error: server-side conversations require an authenticated user header on this server.'
+    : 'Error: server-side conversations require an MCP session.';
+  return { kind: 'error', result: { content: [{ type: 'text', text }], isError: true } };
+}
+
+/** resolveOwnerKey() wrapper for async jobs (phase 13) — see that function for the shared resolution logic. */
+function resolveJobOwner(extra: HoutiniExtra): ConversationOwner {
+  const r = resolveOwnerKey(extra);
+  if (r.kind === 'owner') return r;
+  const text = r.reason === 'header-unusable'
+    ? 'Error: async jobs require an authenticated user header on this server.'
+    : 'Error: async jobs require an MCP session.';
+  return { kind: 'error', result: { content: [{ type: 'text', text }], isError: true } };
 }
 
 /**
@@ -2381,6 +2553,101 @@ const CUSTOM_PROMPT_CONTEXT_PREFIX = 'Here is the context for analysis:\n\n';
 const CUSTOM_PROMPT_CONTEXT_ACK =
   'Understood. I have read the full context. What would you like me to do with it?';
 
+// Added to custom_prompt's and code_task_files' inputSchema.properties when
+// JOBS_ENABLED (see the conditional spreads in TOOLS below) — mirrors the
+// CONVERSATION_PROPS conditional spread pattern above. Phase 13: submit the
+// call as a background job instead of waiting for the result inline.
+const ASYNC_PROPS = {
+  async: {
+    type: 'boolean',
+    description:
+      'Submit this call as a background job instead of waiting for the result inline. Returns a job id ' +
+      'immediately — poll it with the jobs tool (action: "get", job_id: "..."). Submission itself still takes ' +
+      'roughly a second (it resolves model routing first) — "immediately" means no wait for inference, not zero ' +
+      'latency. Not currently supported together with start_conversation/conversation_id — this is a scope limit ' +
+      'for the initial release, not a technical incompatibility, and may be lifted later; submit without those ' +
+      'params when using async: true. Each caller may have only a few jobs pending/running at once ' +
+      '(HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER on the server) — finish or check on one before submitting another.',
+  },
+} as const;
+
+// Shared verbatim across custom_prompt's and code_task_files' async: true
+// branches (see resolveConversation()'s CONVERSATIONS_DISABLED_MESSAGE for
+// the same pattern) — one literal, so the wording can never drift between them.
+const JOBS_DISABLED_MESSAGE = 'Error: async jobs are disabled on this houtini-lm instance (HOUTINI_LM_JOBS=0).';
+const ASYNC_WITH_CONVERSATION_MESSAGE =
+  'Error: async: true does not currently support start_conversation/conversation_id together — this is a scope ' +
+  'limit for the initial release, not a technical incompatibility, and may be lifted later. Submit without the ' +
+  'conversation params when using async: true, or drop async: true to use a conversation.';
+
+/** Shared "not found or not yours" response for the jobs tool — never distinguishes a nonexistent job_id from one owned by someone else, so a caller can't probe for other owners' jobs. */
+const JOB_NOT_FOUND_RESULT: CallToolResult = {
+  content: [{ type: 'text', text: 'Error: this job was not found or is not available to you.' }],
+  isError: true,
+};
+
+/** `jobs.countActive(owner) >= JOB_ACTIVE_MAX_PER_OWNER` guard shared by custom_prompt's and code_task_files' async: true branches. Returns undefined when the caller is under the limit (proceed), else the CallToolResult to return unchanged. */
+function jobActiveLimitError(owner: string): CallToolResult | undefined {
+  if (jobs.countActive(owner) < JOB_ACTIVE_MAX_PER_OWNER) return undefined;
+  return {
+    content: [{
+      type: 'text',
+      text:
+        `Error: you already have ${JOB_ACTIVE_MAX_PER_OWNER} active job(s) (pending + running) — the limit for ` +
+        `this server (HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER). Wait for one to finish, or check on it with the jobs ` +
+        `tool, before submitting another.`,
+    }],
+    isError: true,
+  };
+}
+
+/**
+ * Shared tail of custom_prompt's and code_task_files' synchronous and async
+ * (job) paths: call the model and format the response text (content +
+ * reasoning block + optional footer suffix). Message construction differs
+ * per caller and per sync/async (the sync path threads conversation history
+ * through; async never does — see the async: true branches for why) so it
+ * stays at each call site; only the inference call + formatting is factored
+ * out here — which is also the part that MUST stay byte-identical between a
+ * synchronous call and a completed job's result (see the jobs tool's `get`
+ * action).
+ */
+async function runInference(
+  messages: ChatMessage[],
+  opts: {
+    temperature?: number;
+    maxTokens?: number;
+    model: string;
+    responseFormat?: ResponseFormat;
+    sampling: SamplingParams;
+    forceThinking: boolean;
+    includeReasoning: boolean | undefined;
+    footerExtra?: string;
+    progressToken?: string | number;
+    sendNotification?: ProgressNotifier;
+    softTimeoutMs?: number;
+    prefillTimeoutMs?: number;
+    lockMaxWaitMs?: number;
+  },
+): Promise<{ text: string; resp: StreamingResult }> {
+  const resp = await chatCompletionStreaming(messages, {
+    temperature: opts.temperature,
+    maxTokens: opts.maxTokens,
+    model: opts.model,
+    responseFormat: opts.responseFormat,
+    progressToken: opts.progressToken,
+    sendNotification: opts.sendNotification,
+    sampling: opts.sampling,
+    forceThinking: opts.forceThinking,
+    softTimeoutMs: opts.softTimeoutMs,
+    prefillTimeoutMs: opts.prefillTimeoutMs,
+    lockMaxWaitMs: opts.lockMaxWaitMs,
+  });
+  const reasoningBlock = formatReasoningBlock(opts.includeReasoning, resp);
+  const footer = formatFooter(resp, opts.footerExtra);
+  return { text: resp.content + reasoningBlock + footer, resp };
+}
+
 const TOOLS: Tool[] = [
   {
     name: 'chat',
@@ -2489,6 +2756,7 @@ const TOOLS: Tool[] = [
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
         ...(CONVERSATIONS_ENABLED ? CONVERSATION_PROPS : {}),
+        ...(JOBS_ENABLED ? ASYNC_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
@@ -2580,6 +2848,7 @@ const TOOLS: Tool[] = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...(JOBS_ENABLED ? ASYNC_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
@@ -2670,6 +2939,43 @@ const TOOLS: Tool[] = [
         conversation_id: {
           type: 'string',
           description: 'Required for action: "delete". Ignored for "list" and "clear".',
+        },
+      },
+      required: ['action'],
+    },
+  }] : []),
+  // Only shown when JOBS_ENABLED — mirrors the conditional spread used for
+  // the conversations tool above (phase 13). A sealed instance hides this
+  // tool entirely rather than exposing it and erroring on every call.
+  ...(JOBS_ENABLED ? [{
+    name: 'jobs',
+    description:
+      'Check on or manage async jobs submitted via custom_prompt or code_task_files with async: true. Scoped to ' +
+      'jobs you own — you can never see or touch another owner\'s jobs, and this tool never reveals whether one ' +
+      'exists. `list` returns metadata only (id, tool, state, age) — never result content. `get` returns a job\'s ' +
+      'current status, or its full result once completed — requires job_id. `delete` removes one job\'s record; ' +
+      'it does NOT cancel in-flight inference for a pending/running job — requires job_id.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'get', 'delete'],
+          description:
+            '"list": show your jobs (metadata only, no result content). ' +
+            '"get": fetch one job\'s status, or its result once completed — requires job_id. ' +
+            '"delete": remove one job\'s record — requires job_id. Does not cancel in-flight inference.',
+        },
+        job_id: {
+          type: 'string',
+          description: 'Required for "get" and "delete". The id returned when the job was submitted (async: true).',
+        },
+        wait_ms: {
+          type: 'number',
+          description:
+            '"get" only: if the job has not finished yet, wait up to this many milliseconds (short-polling ' +
+            'internally) before returning its current status, instead of returning immediately. 0 (default) ' +
+            'returns immediately regardless of state. Max 30000 (30s) — values outside 0-30000 are clamped.',
         },
       },
       required: ['action'],
@@ -2817,7 +3123,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id, async: asyncFlag } = args as {
           system?: string;
           context?: string;
           instruction: string;
@@ -2829,7 +3135,97 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           force_thinking?: boolean;
           start_conversation?: boolean;
           conversation_id?: string;
+          async?: boolean;
         };
+
+        // async: true (phase 13) — submit as a background job instead of
+        // running inline. Checked FIRST, before touching conversation state
+        // at all, so a non-async call's behaviour below is completely
+        // unaffected by this branch existing. See ASYNC_PROPS's schema text
+        // for why start_conversation/conversation_id are rejected here
+        // rather than silently ignored.
+        if (asyncFlag === true) {
+          if (!JOBS_ENABLED) {
+            return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
+          }
+          if (start_conversation !== undefined || conversation_id !== undefined) {
+            return { content: [{ type: 'text', text: ASYNC_WITH_CONVERSATION_MESSAGE }], isError: true };
+          }
+          // Owner resolution has no `await` in it (see resolveOwnerKey()),
+          // so this is safe to do early — it's the active-limit CHECK that
+          // must be deferred (see below).
+          const ownerResult = resolveJobOwner(extra);
+          if (ownerResult.kind === 'error') return ownerResult.result;
+          const owner = ownerResult.owner;
+
+          // routeToModel() calls out to list models, so submission itself
+          // takes ~1s here — see ASYNC_PROPS's schema text, which says so
+          // rather than overselling "immediate".
+          const route = await routeToModel('analysis', model);
+          const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
+
+          // No conversation history is possible here (rejected above), so
+          // this is exactly the sync path's "no history" branch: system
+          // prompt, optional context/ack pair, instruction. No dedup check
+          // is needed either — there is no history to dedup against.
+          const messages: ChatMessage[] = [{
+            role: 'system',
+            content: buildSystemPrompt({
+              base: system && system.trim() ? system.trim() : 'You are a precise technical assistant.',
+              formatLine: 'Be direct — no preamble, no restating the question. Use markdown formatting where it helps.',
+              modelConstraint: route.hints.outputConstraint,
+              structuredOutput: !!responseFormat,
+            }),
+          }];
+          if (context) {
+            messages.push({ role: 'user', content: `${CUSTOM_PROMPT_CONTEXT_PREFIX}${context}` });
+            messages.push({ role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK });
+          }
+          messages.push({ role: 'user', content: instruction });
+
+          const promptChars = messages.reduce((n, m) => n + m.content.length, 0);
+          const estimate = await estimatePrefill(promptChars, route.modelId);
+
+          // Checked here — AFTER the routeToModel()/estimatePrefill() awaits
+          // above, immediately before submitJob() — rather than earlier
+          // alongside the JOBS_ENABLED/conversation-param checks. Those two
+          // awaits yield the event loop, so checking the active-job count
+          // before them would leave a window where two concurrent async
+          // calls from the same owner could both read the same
+          // under-the-limit count and both proceed, bypassing
+          // HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER. No further await happens
+          // between this check and submitJob() below (fn is only defined
+          // here, not invoked), so this placement is race-free. Matches
+          // code_task_files' async branch, which places the same check
+          // immediately before its own submitJob() call for the same reason.
+          const limitError = jobActiveLimitError(owner);
+          if (limitError) return limitError;
+
+          const sampling = extractSamplingParams(args as Record<string, unknown>);
+          const fn = async (): Promise<string> => {
+            const { text } = await runInference(messages, {
+              temperature: validTemperature(temperature) ?? route.hints.chatTemp,
+              maxTokens: validMaxTokens(max_tokens),
+              model: route.modelId,
+              responseFormat,
+              sampling,
+              forceThinking: force_thinking === true,
+              includeReasoning: include_reasoning,
+              softTimeoutMs: JOB_SOFT_TIMEOUT_MS,
+              prefillTimeoutMs: JOB_PREFILL_TIMEOUT_MS,
+              lockMaxWaitMs: JOB_LOCK_MAX_WAIT_MS,
+              // No MCP progress channel is threaded through here — a job
+              // outlives the request that submitted it, whose response (and
+              // SSE stream, over HTTP) is already closed by the time this runs.
+            });
+            return text;
+          };
+
+          const jobId = submitJob(owner, 'custom_prompt', fn);
+          return {
+            content: [{ type: 'text', text: formatJobSubmitted(jobId, 'custom_prompt', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN) }],
+          };
+        }
 
         const conv = resolveConversation(start_conversation, conversation_id, extra);
         if (conv.kind === 'error') return conv.result;
@@ -2873,7 +3269,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         }
         messages.push({ role: 'user', content: instruction });
 
-        const resp = await chatCompletionStreaming(messages, {
+        const { text, resp } = await runInference(messages, {
           temperature: validTemperature(temperature) ?? route.hints.chatTemp,
           maxTokens: validMaxTokens(max_tokens),
           model: route.modelId,
@@ -2882,10 +3278,8 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           sendNotification,
           sampling: extractSamplingParams(args as Record<string, unknown>),
           forceThinking: force_thinking === true,
+          includeReasoning: include_reasoning,
         });
-
-        const reasoningBlock = formatReasoningBlock(include_reasoning, resp);
-        const footer = formatFooter(resp);
 
         // Mirror what was actually sent to the model: the context/ack pair
         // is only stored when it was newly injected above, so a
@@ -2909,7 +3303,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         const conversationLine = recordConversationTurns(conv, turnsToStore, contextNote);
 
         return {
-          content: [{ type: 'text', text: resp.content + reasoningBlock + footer + conversationLine }],
+          content: [{ type: 'text', text: text + conversationLine }],
         };
       }
 
@@ -2965,7 +3359,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
       }
 
       case 'code_task_files': {
-        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking } = args as {
+        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking, async: asyncFlag } = args as {
           paths: string[];
           task: string;
           language?: string;
@@ -2973,6 +3367,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           model?: string;
           include_reasoning?: boolean;
           force_thinking?: boolean;
+          async?: boolean;
         };
 
         if (!Array.isArray(paths) || paths.length === 0) {
@@ -3043,7 +3438,13 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         const isConfidentEstimate =
           (estimate.basis === 'linear-fit' && estimate.fit!.r2 >= 0.5) ||
           estimate.basis === 'ratio';
-        if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
+        // The refusal below exists to protect the MCP client's ~60s request
+        // timeout during prefill — an async job (phase 13) has no such
+        // client watching, so it never applies here. The estimate itself is
+        // still computed above (and reused for formatJobSubmitted's
+        // prefillSecEstimate on the async path below); only the refuse
+        // branch is skipped.
+        if (asyncFlag !== true && isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'
             ? `• Estimator: linear fit — TTFT ≈ ${Math.round(estimate.fit!.alphaMs)}ms + ${estimate.fit!.betaMsPerToken.toFixed(2)}ms/token (n=${estimate.fit!.n}, R²=${estimate.fit!.r2.toFixed(2)})`
@@ -3086,25 +3487,80 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           },
         ];
 
+        // Computed before the sync/async branch below — it depends only on
+        // the already-completed file reads, not on the model response.
+        const readSummary = successCount === paths.length
+          ? `${paths.length} file(s) read`
+          : `${successCount}/${paths.length} file(s) read`;
+        const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
+        const codeSampling = extractSamplingParams(args as Record<string, unknown>);
+
+        // async: true (phase 13) — submit as a background job instead of
+        // running inline. Files are already read and validated above (at
+        // this point in the handler, unconditionally) — an invalid path
+        // fails synchronously at submit time, before any job is queued.
+        // Checked here, after the shared read/route/estimate work above (so
+        // the same estimate feeds formatJobSubmitted's prefillSecEstimate)
+        // but before touching the model.
+        if (asyncFlag === true) {
+          if (!JOBS_ENABLED) {
+            return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
+          }
+          // code_task_files has no start_conversation/conversation_id in its
+          // own schema (only chat/custom_prompt do), but guard defensively
+          // against a caller sending them anyway — same rejection as
+          // custom_prompt's async branch, for the same reason.
+          const rawArgs = args as Record<string, unknown>;
+          if (rawArgs.start_conversation !== undefined || rawArgs.conversation_id !== undefined) {
+            return { content: [{ type: 'text', text: ASYNC_WITH_CONVERSATION_MESSAGE }], isError: true };
+          }
+          const ownerResult = resolveJobOwner(extra);
+          if (ownerResult.kind === 'error') return ownerResult.result;
+          const owner = ownerResult.owner;
+          const limitError = jobActiveLimitError(owner);
+          if (limitError) return limitError;
+
+          const fn = async (): Promise<string> => {
+            // Pass codeMaxTokens raw (not `?? DEFAULT_MAX_TOKENS`) so the
+            // 25%-of-context auto-derivation in chatCompletionStreamingInner
+            // fires when the caller omits it — matches the sync path.
+            const { text } = await runInference(codeMessages, {
+              temperature: route.hints.codeTemp,
+              maxTokens: validMaxTokens(codeMaxTokens),
+              model: route.modelId,
+              sampling: codeSampling,
+              forceThinking: force_thinking === true,
+              includeReasoning: include_reasoning,
+              footerExtra: `${lang} · ${readSummary}`,
+              softTimeoutMs: JOB_SOFT_TIMEOUT_MS,
+              prefillTimeoutMs: JOB_PREFILL_TIMEOUT_MS,
+              lockMaxWaitMs: JOB_LOCK_MAX_WAIT_MS,
+              // No MCP progress channel threaded through here — see
+              // custom_prompt's async branch for why.
+            });
+            return text + suggestionLine;
+          };
+
+          const jobId = submitJob(owner, 'code_task_files', fn);
+          return {
+            content: [{ type: 'text', text: formatJobSubmitted(jobId, 'code_task_files', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN) }],
+          };
+        }
+
         // Pass codeMaxTokens raw (not `?? DEFAULT_MAX_TOKENS`) so the 25%-of-context
         // auto-derivation in chatCompletionStreamingInner fires when the caller omits it.
-        const codeResp = await chatCompletionStreaming(codeMessages, {
+        const { text } = await runInference(codeMessages, {
           temperature: route.hints.codeTemp,
           maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
           progressToken,
           sendNotification,
-          sampling: extractSamplingParams(args as Record<string, unknown>),
+          sampling: codeSampling,
           forceThinking: force_thinking === true,
+          includeReasoning: include_reasoning,
+          footerExtra: `${lang} · ${readSummary}`,
         });
-
-        const readSummary = successCount === paths.length
-          ? `${paths.length} file(s) read`
-          : `${successCount}/${paths.length} file(s) read`;
-        const reasoningBlock = formatReasoningBlock(include_reasoning, codeResp);
-        const codeFooter = formatFooter(codeResp, `${lang} · ${readSummary}`);
-        const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
-        return { content: [{ type: 'text', text: codeResp.content + reasoningBlock + codeFooter + suggestionLine }] };
+        return { content: [{ type: 'text', text: text + suggestionLine }] };
       }
 
       case 'discover': {
@@ -3478,6 +3934,74 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         return { content: [{ type: 'text', text: `Cleared ${cleared} conversation${cleared === 1 ? '' : 's'}.` }] };
       }
 
+      case 'jobs': {
+        if (!JOBS_ENABLED) {
+          return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
+        }
+
+        const { action, job_id, wait_ms } = args as { action?: string; job_id?: string; wait_ms?: number };
+        if (action !== 'list' && action !== 'get' && action !== 'delete') {
+          return {
+            content: [{ type: 'text', text: 'Error: action must be one of "list", "get", "delete".' }],
+            isError: true,
+          };
+        }
+
+        const ownerResult = resolveJobOwner(extra);
+        if (ownerResult.kind === 'error') return ownerResult.result;
+        const owner = ownerResult.owner;
+
+        if (action === 'list') {
+          return { content: [{ type: 'text', text: formatJobList(jobs.list(owner), Date.now()) }] };
+        }
+
+        if (job_id === undefined) {
+          return {
+            content: [{ type: 'text', text: `Error: job_id is required for action: "${action}".` }],
+            isError: true,
+          };
+        }
+
+        if (action === 'delete') {
+          // jobs.delete() itself already checks ownership (see job-store.ts)
+          // and returns false for a missing id, a wrong owner, or an
+          // already-gone job — collapsed to one response so a caller can't
+          // probe for other owners' job ids by comparing error text.
+          const existed = jobs.delete(owner, job_id);
+          if (!existed) return JOB_NOT_FOUND_RESULT;
+          return { content: [{ type: 'text', text: `Deleted job ${job_id}.` }] };
+        }
+
+        // action === 'get' — optionally short-poll up to wait_ms (clamped to
+        // 0-30000) before returning the job's current status.
+        const waitMs = (() => {
+          const n = Number(wait_ms);
+          return Number.isFinite(n) && n > 0 ? Math.min(30_000, n) : 0;
+        })();
+        const JOB_GET_POLL_MS = 500;
+        const deadline = Date.now() + waitMs;
+
+        let record = jobs.get(owner, job_id);
+        if (!record) return JOB_NOT_FOUND_RESULT;
+        while ((record.state === 'pending' || record.state === 'running') && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, Math.min(JOB_GET_POLL_MS, Math.max(0, deadline - Date.now()))));
+          const next = jobs.get(owner, job_id);
+          // Vanished mid-wait (e.g. a concurrent delete by this same owner —
+          // a different owner could never see this id at all): same
+          // not-found response as any other missing id, no distinct message.
+          if (!next) return JOB_NOT_FOUND_RESULT;
+          record = next;
+        }
+
+        if (record.state === 'completed') {
+          // Byte-identical to what a synchronous call would have returned
+          // (modulo JobStore's own maxResultChars truncation — see
+          // job-store.ts's truncateResult) — no status line prepended here.
+          return { content: [{ type: 'text', text: record.result ?? '' }] };
+        }
+        return { content: [{ type: 'text', text: formatJobStatus(record, Date.now()) }] };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -3612,9 +4136,14 @@ async function startHttpTransport(): Promise<void> {
       // not the session id, so a conversation outlives the MCP session that
       // created it by design — it's discarded only via `delete`, `clear`,
       // or idle TTL expiry (see resolveConversationOwner()).
+      //
+      // Same reasoning applies to jobs (phase 13) — resolveJobOwner() uses
+      // the identical session-id-vs-header split, so jobs.clear() is gated
+      // on the same CONVERSATION_OWNER_HEADER === '' check.
       if (transport.sessionId) {
         if (CONVERSATION_OWNER_HEADER === '') {
           conversations.clear(transport.sessionId);
+          jobs.clear(transport.sessionId);
         }
         sessions.delete(transport.sessionId);
       }
