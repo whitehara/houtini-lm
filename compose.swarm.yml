@@ -5,8 +5,13 @@
 # never committed here):
 # HOUTINI_LM_IMAGE_TAG      — GHCR image tag to deploy (optional, default: latest)
 # HOUTINI_LM_PUBLIC_HOST    — public hostname this stack is reached at (required)
-# HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://ollama.com)
-# HOUTINI_LM_API_KEY        — backend API key, e.g. Ollama Cloud key (required, secret)
+# HOUTINI_LM_ENDPOINT_URL   — OpenAI-compatible backend base URL, no /v1 suffix (optional, default: https://openrouter.ai/api)
+# HOUTINI_LM_API_KEY        — backend API key for the configured provider (required, secret)
+# HOUTINI_LM_MODEL          — default model id to pin (optional, default: unset = auto-route). Leaving
+#                             this unset on a large-catalogue backend like OpenRouter (300+ models,
+#                             all reporting as routable) makes auto-routing pick whichever model
+#                             happens to sort first in that backend's catalogue, which can change
+#                             without warning — pin this explicitly on such backends.
 # HOUTINI_LM_FILE_ROOTS     — code_task_files allow-list; defaults to the houtini-lm_shared
 #                             NFS mount below so remote clients can hand files to code_task_files
 #                             by writing into that shared tree. Point at a non-existent path to
@@ -98,8 +103,9 @@ services:
       # not correctly resolve OAuth protected-resource metadata or token
       # resource/audience for a non-root backend path.
       - HOUTINI_LM_HTTP_PATH=/
-      - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://ollama.com}
+      - HOUTINI_LM_ENDPOINT_URL=${HOUTINI_LM_ENDPOINT_URL:-https://openrouter.ai/api}
       - HOUTINI_LM_API_KEY=${HOUTINI_LM_API_KEY:-}
+      - HOUTINI_LM_MODEL=${HOUTINI_LM_MODEL:-}
       - HOUTINI_LM_FILE_ROOTS=${HOUTINI_LM_FILE_ROOTS:-/mnt/houtini-lm-share}
       - HOUTINI_LM_SERIALISE=${HOUTINI_LM_SERIALISE:-0}
       - HOUTINI_LM_CROSS_PROCESS_LOCK=${HOUTINI_LM_CROSS_PROCESS_LOCK:-0}
