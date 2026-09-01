@@ -32,7 +32,7 @@ This README is the overview. The depth lives in focused pages:
 | Page | What's in it |
 |---|---|
 | [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
-| [The tools, in depth](./manual/tools.md) | All nine tools: the parameters that matter, reading the footer, the max_tokens floor |
+| [The tools, in depth](./manual/tools.md) | All ten tools: the parameters that matter, reading the footer, the max_tokens floor |
 | [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
 | [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
 | [LM Studio setup](./docs/SETUP-LMSTUDIO.md) · [Ollama setup](./docs/SETUP-OLLAMA.md) · [vLLM setup](./docs/SETUP-VLLM.md) | Backend guides, each with the traps that cause silent failures |
@@ -337,6 +337,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
 | `start_conversation` | no | `false` | Start a new server-side conversation — its id comes back on the response's last line. Pass that id as `conversation_id` on every following call and send only the new instruction; the server keeps the history for you. Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
 | `conversation_id` | no | - | Continue a conversation started with `start_conversation: true` — send only the new instruction, the server prepends the stored history automatically. Wins over `start_conversation` when both are given (the latter is then ignored). Not present in the schema at all when `HOUTINI_LM_CONVERSATIONS` is disabled. See [Server-side conversations](#server-side-conversations). |
+| `async` | no | `false` | Submit as a background job instead of waiting for the answer inline — the call returns a job id immediately, before inference starts. Poll it with the [`jobs`](#jobs) tool. Cannot be combined with `start_conversation` or `conversation_id`. Not present in the schema at all when `HOUTINI_LM_JOBS` is disabled. See [Async jobs](#async-jobs). |
 
 ### `code_task`
 
@@ -367,6 +368,7 @@ Includes a **pre-flight prefill estimator**: if measured per-model data from the
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 | `include_reasoning` | no | `false` | When `true` and the model produced reasoning, append it after the answer, delimited from the final response. Only effective when the backend actually returns reasoning — see [Think-block handling](#think-block-handling). |
 | `force_thinking` | no | `false` | Disables the server's automatic thinking suppression for this one call so the model actually thinks — costs latency and generated tokens. Pair with `include_reasoning: true` to see the result. Ignored when the server runs with `HOUTINI_LM_THINKING=off`. No effect on OpenRouter-routed calls yet. |
+| `async` | no | `false` | Submit as a background job instead of waiting for the answer inline — the call returns a job id immediately, after files are read but before inference starts. Poll it with the [`jobs`](#jobs) tool. Not present in the schema at all when `HOUTINI_LM_JOBS` is disabled. See [Async jobs](#async-jobs). |
 
 ### `embed`
 
@@ -431,6 +433,22 @@ Manage server-side conversations started with `chat` or `custom_prompt`'s `start
 
 See [Server-side conversations](#server-side-conversations) below for the full picture.
 
+### `jobs`
+
+Manage background jobs submitted with `async: true` on `custom_prompt` or `code_task_files`. Scoped strictly to the jobs you own, the same way `conversations` is scoped to your conversations — see [Isolation boundary](#server-side-conversations). Not listed in `tools/list` at all when `HOUTINI_LM_JOBS` is disabled.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `action` | yes | - | `list`, `get`, or `delete`. |
+| `job_id` | required for `get`/`delete` | - | Which job to look up or remove. Ignored for `list`. |
+| `wait_ms` | no | `0` | For `get` only: instead of returning the job's current state immediately, block up to this many milliseconds for it to finish, then return whatever state it's in. Clamped to 30,000. Use this to poll without hammering the tool. |
+
+- **`list`** — a markdown table of your jobs: id, tool, state, submitted time. Metadata only — never the result body.
+- **`get`** — full detail for one job: state (`pending`, `running`, `completed`, `failed`), and once `completed` or `failed`, the result or error. A `completed` job's result is byte-identical to what the equivalent synchronous call would have returned, aside from truncation under `HOUTINI_LM_JOB_MAX_RESULT_CHARS`. An id that never existed and an id owned by someone else return the *exact same* error, for the same reason `conversations`' `delete` does.
+- **`delete`** — removes one job by `job_id`. This only forgets the job record; it does **not** cancel in-flight inference — a `running` job keeps running against the backend, it just stops being retrievable.
+
+See [Async jobs](#async-jobs) below for the full picture.
+
 ## Server-side conversations
 
 `chat` and `custom_prompt` can remember a conversation across calls entirely server-side, so the caller stops resending the whole transcript on every turn. This is fully opt-in: leave `start_conversation` and `conversation_id` unset on both tools and nothing changes — the server behaves exactly as it did before this feature existed.
@@ -465,6 +483,31 @@ See [Server-side conversations](#server-side-conversations) below for the full p
 **Sizing note** — a single very long `context` passed to `custom_prompt` can by itself consume most or all of `HOUTINI_LM_CONVERSATION_MAX_CHARS` (default 48,000 characters) in one call. If you plan to lean on `context` heavily inside a conversation, consider raising that variable — see [Configuration](#configuration).
 
 **Turning it off** — set `HOUTINI_LM_CONVERSATIONS=0` (also accepts `false`/`no`/`off`) and both parameters disappear from `chat`'s and `custom_prompt`'s schemas entirely, and the `conversations` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call.
+
+## Async jobs
+
+MCP clients (including Claude's own Agent tool) time out a `tools/call` well before a reasoning-heavy model or a large `code_task_files` input finishes — the client gives up around the one-minute mark while the server's own [soft timeout](#streaming-and-timeouts) is five minutes, so the server can still be productively streaming tokens long after the caller has already reported failure. `custom_prompt` and `code_task_files` accept `async: true` for exactly this case: the call returns a job id immediately instead of waiting for the answer, and you retrieve the result later with the [`jobs`](#jobs) tool — no single request, on either side, ever has to stay open for the full duration of a long completion.
+
+**Submitting** — pass `async: true` to `custom_prompt` or `code_task_files`. `code_task_files` still reads and validates every path *before* returning — a bad path fails the call synchronously, exactly as it would without `async`; only the inference itself runs in the background. The response is just a job id and a one-line confirmation, including the same prefill estimate a synchronous call would warn about:
+
+```
+🚀 Job 7f3a1c2e-... submitted (code_task_files, ~4,821 input tokens, est. ~12s prefill).
+Poll with jobs get, job_id: "7f3a1c2e-...". Result kept for 60min after completion.
+```
+
+**Retrieving** — call `jobs` with `action: "get"` and the `job_id`. A job moves through `pending` → `running` → `completed`/`failed`; poll with `wait_ms` to avoid a tight loop (see [`jobs`](#jobs)). A `completed` job's result is the same body a synchronous call would have returned, aside from truncation under `HOUTINI_LM_JOB_MAX_RESULT_CHARS`.
+
+**Isolation boundary** — identical to [conversations](#server-side-conversations): a job belongs to the MCP connection that submitted it, unless `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is set, in which case it belongs to the named header's value instead. The two features share one owner-resolution mechanism and the same header, even though jobs and conversations are otherwise independent stores.
+
+**Known limitations** — this is a lightweight, in-memory feature, not a durable job queue:
+- Everything is lost on a process restart or redeploy, including jobs still `running`. Nothing is persisted to disk.
+- `deploy.replicas` must stay at `1` — the job store is in-memory and per-process, exactly like conversations.
+- There's no real cancellation. `jobs` `delete` only forgets the record; it doesn't stop the in-flight request against the backend.
+- At most `HOUTINI_LM_JOB_CONCURRENCY` jobs actually run inference at once (default `1`) — extra submissions queue as `pending` rather than running in parallel. Cross-process inference serialisation (see [Request serialisation](#request-serialisation)) is best-effort for jobs specifically: a job's soft timeout can outlast the cross-process lock's own staleness window, so a very long job's lock can in principle be taken by another process. This is a deliberate fail-open tradeoff, not a bug.
+- `async` cannot be combined with `start_conversation` or `conversation_id` — a job and a conversation turn are two different lifecycles, and combining them is out of scope for now.
+- Each owner may have at most `HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER` jobs (`pending` or `running`) at once (default `2`); submitting past that limit is rejected outright rather than queued.
+
+**Turning it off** — set `HOUTINI_LM_JOBS=0` (also accepts `false`/`no`/`off`) and `async` disappears from `custom_prompt`'s and `code_task_files`'s schemas entirely, and the `jobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call. This is also the fastest way to fall back to fully synchronous behaviour without rolling back the image.
 
 ## Structured JSON output
 
@@ -520,7 +563,7 @@ The canonical way to verify an install and get an honest read on what the loaded
 npm run shakedown
 ```
 
-This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the nine tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` and `conversations` are not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the ten tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats`, `conversations`, and `jobs` are not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
 
 Sample output tail:
 
@@ -620,6 +663,13 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_CONVERSATION_MAX_TURNS` | `40` | Max user/assistant turns retained per conversation before the oldest are trimmed. |
 | `HOUTINI_LM_CONVERSATION_MAX_CHARS` | `48000` | Max total characters retained per conversation before the oldest turns are trimmed. A single very long `custom_prompt` `context` can consume most of this budget in one call — raise it if you lean on `context` heavily inside conversations. See [Server-side conversations](#server-side-conversations). |
 | `HOUTINI_LM_CONVERSATION_OWNER_HEADER` | unset | Name of an HTTP request header carrying an authenticated caller identity; when set, conversations are scoped to that identity instead of the MCP session. See [Server-side conversations § Isolation boundary](#server-side-conversations). |
+| `HOUTINI_LM_JOBS` | `1` (on) | Enables `async` on `custom_prompt` and `code_task_files`, and the `jobs` tool. Set to `0` (also accepts `false`/`no`/`off`) to disable — both the parameter and the `jobs` tool disappear from the schema entirely rather than being present and erroring. Also doubles as a production kill switch: flip it off and redeploy to fall back to fully synchronous behaviour without rolling back the image. See [Async jobs](#async-jobs). |
+| `HOUTINI_LM_JOB_TTL_MIN` | `60` | Idle-expiry window for a job record, in minutes, measured from submission (not from completion). |
+| `HOUTINI_LM_JOB_MAX` | `50` | Max job records held at once, across all owners. Oldest by submission time is evicted on overflow. |
+| `HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER` | `2` | Max `pending`/`running` jobs a single owner may have at once. Submitting past this limit is rejected outright. |
+| `HOUTINI_LM_JOB_CONCURRENCY` | `1` | Max jobs actually running inference at once, across all owners. Extra submissions queue as `pending`. |
+| `HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN` | `15` | Per-job soft timeout, in minutes — same mechanism as the server's own [soft timeout](#streaming-and-timeouts), applied per job instead of per request. |
+| `HOUTINI_LM_JOB_MAX_RESULT_CHARS` | `200000` | Max characters kept for a completed job's result. A result longer than this is truncated before being stored. |
 
 **Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 
@@ -646,6 +696,8 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 All inference uses Server-Sent Events streaming. Tokens arrive incrementally. Since v2.9.0, houtini-lm sends MCP progress notifications on every streamed chunk — including during the thinking phase for reasoning models — which resets the SDK's 60-second client timeout. A 5-minute soft timeout acts as a safety net so a wedged connection can't hold a tool call open indefinitely; as long as tokens keep flowing, the per-chunk progress keeps the client side alive up to that ceiling.
 
 If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so Claude knows to treat the output with appropriate caution.
+
+When a call is going to run long enough that even the client's own timeout (rather than a stalled connection) is the risk — a reasoning-heavy model, or a large `code_task_files` input — submit it with `async: true` instead and poll for the result. See [Async jobs](#async-jobs).
 
 ## Architecture
 

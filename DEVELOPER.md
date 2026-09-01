@@ -16,12 +16,16 @@ src/
                       support detection, per-model performance history
   conversation-store.ts In-memory, TTL-bounded store for server-side
                       chat/custom_prompt conversation history (phase 9)
+  job-store.ts        In-memory, TTL-bounded store for background jobs
+                      submitted via custom_prompt/code_task_files' async:
+                      true (phase 13) — mirrors conversation-store.ts's
+                      design (no timers, lazy TTL sweep, owner-scoped access)
 server.json           MCP registry manifest
 scripts/test.mjs      Direct-client integration tests (hits /v1 endpoints)
 scripts/test-mcp-e2e.mjs End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
 scripts/benchmark.mjs Throughput + savings benchmark
-scripts/shakedown.mjs End-to-end self-test — runs 7 of the 9 tools in sequence (all except stats and conversations)
+scripts/shakedown.mjs End-to-end self-test — runs 7 of the 10 tools in sequence (all except stats, conversations, and jobs)
 docs/SHAKEDOWN.md     Canonical test prompt (for running via Claude chat)
 scripts/add-shebang.mjs Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
@@ -317,7 +321,7 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 ## Testing
 
-Nine independent test harnesses, each with a different scope:
+Eleven independent test harnesses, each with a different scope:
 
 - **`scripts/test.mjs`** — **direct-client** integration test. Hits the provider's
   `/v1/*` endpoints without going through the MCP server. Good for
@@ -334,7 +338,7 @@ Nine independent test harnesses, each with a different scope:
   override.
 - **`scripts/benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`scripts/shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs 7 of the 9 tools end-to-end (all except `stats` and `conversations`) and prints a summary table with TTFT, tok/s,
+  Runs 7 of the 10 tools end-to-end (all except `stats`, `conversations`, and `jobs`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
 - **`scripts/test-conversation-store.mjs`** (`npm run test:conversations`) —
@@ -349,6 +353,16 @@ Nine independent test harnesses, each with a different scope:
   the stdio-transport counterpart to the above. HTTP always has an MCP
   session id, so this is what actually exercises the
   `HOUTINI_LM_TRANSPORT === 'stdio'` owner-resolution branch.
+- **`scripts/test-job-store.mjs`** (`npm run test:jobs`) — **unit** test for
+  `JobStore` and `formatJobSubmitted`/`formatJobStatus`/`formatJobList`.
+  Pure logic, no backend or built server needed — mirrors
+  `test-conversation-store.mjs`'s scope and structure.
+- **`scripts/test-jobs-e2e.mjs`** (`npm run test:jobs:e2e`) — **end-to-end
+  async jobs over HTTP**. Spawns `dist/index.js` against
+  `fake-openai-backend.mjs` and drives `async: true` submission, `jobs`
+  `get`/`list`/`delete`, `wait_ms` polling, the active-jobs-per-owner limit,
+  result truncation, and the `HOUTINI_LM_JOBS=0` disabled path through real
+  tool calls.
 - **`scripts/test-http-transport.mjs`** (`npm run test:http`) — verifies the
   Streamable HTTP transport itself: session lifecycle, `tools/list`,
   `tools/call` with progress notifications routed to the correct session,

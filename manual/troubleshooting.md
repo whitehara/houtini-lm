@@ -28,7 +28,7 @@ If you actually want the local model's own reasoning surfaced:
 
 **The MCP client's ~60s request timeout, not the server's.** houtini-lm streams progress notifications from the moment the call is acknowledged - per-chunk during generation, heartbeats every 10s during prefill, even before the backend's HTTP headers arrive - and clients that honour `resetTimeoutOnProgress` (Claude Desktop does) will happily sit through multi-minute calls. Clients that ignore the keepalives will kill the request at their timeout regardless of what the server does.
 
-If your client is the ignoring kind: split the work into smaller calls ([micro-chunking](delegation.md#micro-chunking-on-slow-hardware)), or trim the input. The `code_task_files` pre-flight estimator exists precisely to refuse calls that would die this death - a refusal with a diagnostic beats sixty silent seconds and an error.
+If your client is the ignoring kind: split the work into smaller calls ([micro-chunking](delegation.md#micro-chunking-on-slow-hardware)), trim the input, or submit the call with `async: true` on `custom_prompt`/`code_task_files` instead and poll for the result with the `jobs` tool - see [Async jobs](../README.md#async-jobs) in the README. The `code_task_files` pre-flight estimator exists precisely to refuse synchronous calls that would die this death - a refusal with a diagnostic beats sixty silent seconds and an error (the estimator doesn't fire on `async` calls, since there's no client timeout to protect there).
 
 ## code_task_files refuses with "estimated prefill time exceeds the ~60s MCP client timeout"
 
@@ -79,6 +79,27 @@ Per-model stats key on the model id the backend reports. Serve the same weights 
 - The id belongs to a different owner entirely.
 
 There's nothing to recover - start a new conversation with `start_conversation: true` rather than retrying the old id. See [Server-side conversations](../README.md#server-side-conversations) in the README for how the lifecycle works.
+
+## jobs get fails with "not found or is not available to you"
+
+**Same deliberate non-disclosure as the conversation error above, for the same reason** - `jobs`' `get` and `delete` give this identical wording regardless of cause, so the error can't be used to probe for other owners' job ids:
+
+- It sat past `HOUTINI_LM_JOB_TTL_MIN` (default 60 minutes, measured from submission) and was swept away.
+- It was evicted by the LRU cap - `HOUTINI_LM_JOB_MAX` (default 50) job records total, across every owner.
+- The server process restarted or was redeployed - jobs are in-memory only, including ones that were still `running`, nothing survives that.
+- You're on the HTTP transport and reconnected, landing on a new `mcp-session-id` - jobs are scoped to the MCP session that submitted them, same as conversations when `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is unset. **This does not apply when that variable is set** - jobs are then scoped to an authenticated caller identity instead, so a new session from the same caller can still see them.
+- You (or something else with access) already called `delete` on it.
+- The id belongs to a different owner entirely.
+
+There's nothing to recover - submit a new job with `async: true` rather than retrying the old id.
+
+## A job stays pending and never starts running
+
+**`HOUTINI_LM_JOB_CONCURRENCY` (default `1`) is already saturated.** Only that many jobs actually run inference at once, server-wide - everything past it queues as `pending` until a slot frees up. Check `jobs list` for other `running` jobs (yours or, if you can't see them, ask whoever else is using this server instance); a `pending` job with nothing else `running` anywhere is a bug worth reporting, not this.
+
+## async can't be combined with start_conversation or conversation_id
+
+**Deliberate scope limit, not a missing feature.** A background job and a server-side conversation turn are two different lifecycles with different ownership and expiry rules, and combining them (an async call that also reads or extends conversation history) isn't supported yet. Use one or the other on a given call: `async: true` alone for a one-off background job, or `start_conversation`/`conversation_id` alone for a synchronous conversational turn.
 
 ## Where to look when none of this fits
 

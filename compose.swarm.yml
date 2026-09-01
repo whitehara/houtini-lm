@@ -36,7 +36,22 @@
 #                             name rather than appending to it — an appending proxy would let a
 #                             client spoof another user's identity. This must name the same header
 #                             MCP_AUTH_PROXY_HEADER_MAPPING (below) is configured to set, or the
-#                             header this server looks for will never arrive.
+#                             header this server looks for will never arrive. Also governs who owns
+#                             an async job below — jobs and conversations share this one setting.
+# HOUTINI_LM_JOBS                — enable/disable async jobs (async: true on custom_prompt/
+#                             code_task_files, plus the jobs tool), 1/0 (optional, default: 1).
+#                             Doubles as a production kill switch: set to 0 and redeploy to fall
+#                             back to fully synchronous behaviour without rolling back the image.
+# HOUTINI_LM_JOB_TTL_MIN          — job-record idle-expiry window in minutes, from submission (optional, default: 60)
+# HOUTINI_LM_JOB_MAX               — max job records held at once, across all owners (optional, default: 50)
+# HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER — max pending/running jobs a single owner may have at once (optional, default: 2)
+# HOUTINI_LM_JOB_CONCURRENCY       — max jobs actually running inference at once, across all owners (optional, default: 1)
+# HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN  — per-job soft timeout in minutes (optional, default: 15)
+# HOUTINI_LM_JOB_MAX_RESULT_CHARS  — max characters kept for a completed job's result (optional, default: 200000)
+#                             Like the conversation variables above, these seven are passed through
+#                             below with an empty-string fallback (${VAR:-}) rather than a number
+#                             baked into this file — the one true default for each lives in
+#                             src/index.ts, so this file can never silently drift out of sync with it.
 # MCP_AUTH_PROXY_HEADER_MAPPING — mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` equivalent:
 #                             a JSON-pointer-to-header-name mapping (e.g. "/sub:X-Forwarded-User")
 #                             that forwards an OIDC claim as the request header
@@ -115,6 +130,13 @@ services:
       - HOUTINI_LM_CONVERSATION_MAX_TURNS=${HOUTINI_LM_CONVERSATION_MAX_TURNS:-}
       - HOUTINI_LM_CONVERSATION_MAX_CHARS=${HOUTINI_LM_CONVERSATION_MAX_CHARS:-}
       - HOUTINI_LM_CONVERSATION_OWNER_HEADER=${HOUTINI_LM_CONVERSATION_OWNER_HEADER:-}
+      - HOUTINI_LM_JOBS=${HOUTINI_LM_JOBS:-}
+      - HOUTINI_LM_JOB_TTL_MIN=${HOUTINI_LM_JOB_TTL_MIN:-}
+      - HOUTINI_LM_JOB_MAX=${HOUTINI_LM_JOB_MAX:-}
+      - HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER=${HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER:-}
+      - HOUTINI_LM_JOB_CONCURRENCY=${HOUTINI_LM_JOB_CONCURRENCY:-}
+      - HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN=${HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN:-}
+      - HOUTINI_LM_JOB_MAX_RESULT_CHARS=${HOUTINI_LM_JOB_MAX_RESULT_CHARS:-}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
       - houtini-lm_shared:/mnt/houtini-lm-share:ro
@@ -128,10 +150,12 @@ services:
       start_period: 10s
     deploy:
       mode: replicated
-      # Server-side conversations live in memory, per process, not shared
-      # across replicas — raising this above 1 would let a client's calls
-      # land on a different replica mid-conversation and silently lose its
-      # history. Keep this at 1 (or set HOUTINI_LM_CONVERSATIONS=0 first).
+      # Server-side conversations AND async jobs both live in memory, per
+      # process, not shared across replicas — raising this above 1 would
+      # let a client's calls land on a different replica mid-conversation
+      # (silently losing its history) or land a jobs poll on a replica
+      # that never saw the job it's asking about. Keep this at 1 (or set
+      # HOUTINI_LM_CONVERSATIONS=0 and HOUTINI_LM_JOBS=0 first).
       replicas: 1
       restart_policy:
         condition: any
