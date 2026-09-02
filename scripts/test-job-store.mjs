@@ -1,7 +1,7 @@
 // Unit test for JobStore + formatJobSubmitted/formatJobStatus/formatJobList
 // (phase 13: async job execution). Pure logic, no backend needed.
 // Run: npm run test:jobs
-import { JobStore, formatJobSubmitted, formatJobStatus, formatJobList } from '../dist/job-store.js';
+import { JobStore, formatJobSubmitted, formatJobStatus, formatJobList, sliceResult, formatJobChunkFooter } from '../dist/job-store.js';
 
 let failed = 0;
 const eq = (name, got, want) => {
@@ -24,6 +24,16 @@ function makeClock(start) {
 }
 
 const DEFAULT_OPTS = { ttlMs: 60_000, maxJobs: 10, maxResultChars: 200_000 };
+
+// Test-local helper (phase 14-1 assertions) — true if `ch` (a single JS
+// string character) is a UTF-16 low surrogate. Independent of job-store.ts's
+// internal isLowSurrogate(), which is not exported — this just checks the
+// *observable* result never ends on a lone low half.
+function isLowSurrogateChar(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  return code >= 0xdc00 && code <= 0xdfff;
+}
 
 // --- basic lifecycle: create → pending → markRunning → markCompleted → get() ---
 {
@@ -309,6 +319,239 @@ const DEFAULT_OPTS = { ttlMs: 60_000, maxJobs: 10, maxResultChars: 200_000 };
   ok('formatJobList sorts most-recently-used first', twoOutput.indexOf('newer-id') < twoOutput.indexOf('older-id'));
   ok('formatJobList includes tool and state', twoOutput.includes('code_task_files') && twoOutput.includes('running'));
   ok('formatJobList has no leading or trailing newline', !twoOutput.startsWith('\n') && !twoOutput.endsWith('\n'));
+}
+
+// ============================================================================
+// Phase 14-1: sliceResult / formatJobChunkFooter / JobStore.touch() /
+// JobSummary.resultChars — output-side chunked retrieval for `jobs get`.
+// See .claude/phases/phase14-mcp-payload-blobs.md's フェーズ14-1 section for
+// the S1-S5 decision record these cases are asserting against.
+// ============================================================================
+
+// --- sliceResult: (1) full text when limit >= total ---
+{
+  const s = sliceResult('hello world', 0, 100, 0);
+  eq('sliceResult: limit >= total returns the full text', s.text, 'hello world');
+  eq('sliceResult: start is 0', s.start, 0);
+  eq('sliceResult: end equals total', s.end, 11);
+  eq('sliceResult: total is text.length', s.total, 11);
+}
+
+// --- sliceResult: (2) a window in the middle ---
+{
+  const s = sliceResult('hello world', 2, 3, 0);
+  eq('sliceResult: middle window text', s.text, 'llo');
+  eq('sliceResult: middle window start', s.start, 2);
+  eq('sliceResult: middle window end', s.end, 5);
+}
+
+// --- sliceResult: (3) offset > total -> empty chunk, offset clamped to total ---
+{
+  const s = sliceResult('hi', 10, 5, 0);
+  eq('sliceResult: offset > total clamps start to total', s.start, 2);
+  eq('sliceResult: offset > total yields end === start (empty)', s.end, 2);
+  eq('sliceResult: offset > total yields empty text', s.text, '');
+}
+
+// --- sliceResult: (4) offset < 0 -> 0 ---
+{
+  const s = sliceResult('hello', -5, 3, 0);
+  eq('sliceResult: negative offset clamps to 0', s.start, 0);
+  eq('sliceResult: negative offset then normal window', s.text, 'hel');
+}
+
+// --- sliceResult: (5) limit <= 0 -> default window (ceiling>0, then ceiling===0) ---
+{
+  const s = sliceResult('hello world', 2, 0, 4);
+  eq('sliceResult: limit<=0 with ceiling>0 uses ceiling as the window', s.text, 'llo ');
+}
+{
+  const s = sliceResult('hello', 1, undefined, 0);
+  eq('sliceResult: limit undefined with ceiling===0 takes the rest of the text', s.text, 'ello');
+  eq('sliceResult: limit undefined with ceiling===0 reaches total', s.end, 5);
+}
+
+// --- sliceResult: (6) non-integer offset/limit are floored ---
+{
+  const s = sliceResult('abcdefghij', 2.9, 3.9, 0);
+  eq('sliceResult: non-integer offset is floored', s.start, 2);
+  eq('sliceResult: non-integer limit is floored', s.text, 'cde');
+}
+
+// --- sliceResult: (7) limit > ceiling, ceiling>0 -> clamped to ceiling ---
+{
+  const s = sliceResult('abcdefghij', 0, 8, 3);
+  eq('sliceResult: limit above a positive ceiling is clamped to it', s.text, 'abc');
+  eq('sliceResult: clamped end reflects the ceiling, not the requested limit', s.end, 3);
+}
+
+// --- sliceResult: (8) ceiling===0 -> no clamp, even for a huge limit ---
+{
+  const s = sliceResult('abcdefghij', 0, 999, 0);
+  eq('sliceResult: ceiling===0 applies no upper clamp', s.text, 'abcdefghij');
+  eq('sliceResult: ceiling===0 lets end reach total', s.end, 10);
+}
+
+// --- sliceResult: (9) S4 — end lands mid-pair, backs off so no half surrogate is emitted ---
+{
+  const text = `ab${'😀'}cd`; // 'ab' + one astral emoji (surrogate pair) + 'cd'
+  const s = sliceResult(text, 0, 3, 0);
+  eq('sliceResult: S4 backs `end` off the pair boundary', s.end, 2);
+  eq('sliceResult: S4-adjusted chunk stops cleanly before the pair', s.text, 'ab');
+  ok('sliceResult: S4 chunk does not end on a lone low surrogate', !isLowSurrogateChar(s.text[s.text.length - 1]));
+}
+
+// --- sliceResult: (10) S5 — degenerate case, limit=1 at a pair's high half still returns the whole pair ---
+{
+  const text = `${'😀'}x`; // emoji (pair) + 'x'
+  const s = sliceResult(text, 0, 1, 0);
+  eq('sliceResult: S5 degenerate rescue advances end to start+2, not start+1', s.end, s.start + 2);
+  eq('sliceResult: S5 returns the whole surrogate pair, not a lone half', s.text, '😀');
+}
+
+// --- sliceResult: (11) S2 — offset lands mid-pair, start backs off to the pair's head ---
+{
+  const text = `x${'😀'}y`; // 'x' + emoji (pair) + 'y'
+  const s = sliceResult(text, 2, 2, 0); // offset 2 = the pair's low half
+  eq('sliceResult: S2 backs `start` off to the pair head', s.start, 1);
+  eq('sliceResult: S2-adjusted chunk begins at the pair, intact', s.text, '😀');
+}
+
+// --- sliceResult: (12) isolated (unpaired) surrogates are left untouched ---
+{
+  // Lone low surrogate at the requested start, with no high surrogate before it.
+  const text = 'a\uDC00b';
+  const s = sliceResult(text, 1, 1, 0);
+  eq('sliceResult: an isolated low surrogate at `start` is not adjusted', s.start, 1);
+  eq('sliceResult: the isolated surrogate is returned as-is', s.text, '\uDC00');
+}
+{
+  // Lone high surrogate that `end` would land just after, with no low surrogate following it.
+  const text = 'a\uD800b';
+  const s = sliceResult(text, 0, 2, 0);
+  eq('sliceResult: an isolated high surrogate at `end` is not adjusted', s.end, 2);
+  eq('sliceResult: the chunk keeps the isolated high surrogate intact', s.text, 'a\uD800');
+}
+
+// --- sliceResult: (13) footer-driven round trip — no data loss, no infinite loop ---
+{
+  // Helper for the round-trip walk: mirrors how index.ts (phase 14-1b) is
+  // expected to page — always follow the previous slice's `end`, never
+  // compute the next offset by arithmetic.
+  function walkChunks(text, limit, ceiling) {
+    let offset = 0;
+    const chunks = [];
+    let iterations = 0;
+    const maxIterations = text.length + 2; // conservative bound accounting for ±1 boundary adjustments
+    for (;;) {
+      iterations++;
+      if (iterations > maxIterations) {
+        throw new Error(`walkChunks exceeded ${maxIterations} iterations — possible infinite loop`);
+      }
+      const slice = sliceResult(text, offset, limit, ceiling);
+      chunks.push(slice.text);
+      if (slice.end >= slice.total) break;
+      offset = slice.end;
+    }
+    return { joined: chunks.join(''), iterations };
+  }
+
+  const text = `Hi${'😀'.repeat(3)}Bye${'😀'}`; // mixed ASCII + astral emoji
+  for (const limit of [1, 2, 3]) {
+    const { joined, iterations } = walkChunks(text, limit, 0);
+    eq(`sliceResult: footer-driven round trip (limit=${limit}) reconstructs the original text`, joined, text);
+    ok(`sliceResult: footer-driven round trip (limit=${limit}) terminates within text.length + 2 iterations`, iterations <= text.length + 2);
+  }
+}
+
+// --- formatJobChunkFooter: (14) P1 — partial chunk, exact text + Next as numeric JSON ---
+{
+  const slice = { text: 'cde', start: 2, end: 5, total: 10 };
+  const footer = formatJobChunkFooter('job-1', slice, 5);
+  const want = '\n\n--- job result chunk: chars 2-5 of 10 (end-exclusive) ---\nNext: {"action":"get","id":"job-1","offset":5,"limit":5}';
+  eq('formatJobChunkFooter: P1 partial-chunk footer matches exactly', footer, want);
+  const nextJson = JSON.parse(footer.slice(footer.indexOf('Next: ') + 'Next: '.length));
+  ok('formatJobChunkFooter: P1 Next.offset is a number, not a string', typeof nextJson.offset === 'number');
+  ok('formatJobChunkFooter: P1 Next.limit is a number, not a string', typeof nextJson.limit === 'number');
+}
+
+// --- formatJobChunkFooter: (15) P2 — final chunk ---
+{
+  const slice = { text: 'fghij', start: 5, end: 10, total: 10 };
+  const footer = formatJobChunkFooter('job-1', slice, 5);
+  const want = '\n\n--- job result chunk: chars 5-10 of 10 (end-exclusive, end of result) ---';
+  eq('formatJobChunkFooter: P2 final-chunk footer matches exactly', footer, want);
+  ok('formatJobChunkFooter: P2 final-chunk footer has no Next line', !footer.includes('Next:'));
+}
+
+// --- formatJobChunkFooter: (16) P3 — empty chunk (offset at or beyond end) ---
+{
+  const slice = { text: '', start: 10, end: 10, total: 10 };
+  const footer = formatJobChunkFooter('job-1', slice, 5);
+  const want = '\n\n--- job result chunk: chars 10-10 of 10 (end-exclusive, empty: offset is at or beyond end of result) ---';
+  eq('formatJobChunkFooter: P3 empty-chunk footer matches exactly', footer, want);
+}
+
+// --- JobStore.touch(): (17) matching owner updates lastUsedAt and returns true ---
+{
+  const clock = makeClock(0);
+  const store = new JobStore({ ...DEFAULT_OPTS, now: clock.now });
+  const owner = 'session-touch-a';
+  const id = store.create(owner, 'custom_prompt');
+  store.markRunning(id);
+  store.markCompleted(id, 'result body');
+  const before = store.get(owner, id).lastUsedAt;
+  clock.advance(500);
+  ok('touch(): matching owner returns true', store.touch(owner, id) === true);
+  const after = store.get(owner, id).lastUsedAt;
+  ok('touch(): matching owner advances lastUsedAt', after > before);
+
+  // --- JobStore.touch(): (18) wrong owner -> false, unchanged ---
+  const stillBefore = after;
+  clock.advance(500);
+  eq('touch(): wrong owner returns false', store.touch('session-touch-wrong', id), false);
+  eq('touch(): wrong owner does not update lastUsedAt', store.get(owner, id).lastUsedAt, stillBefore);
+
+  // --- JobStore.touch(): (18b) unknown id -> false, no throw ---
+  let threw = false;
+  let result;
+  try {
+    result = store.touch(owner, 'no-such-id-xyz');
+  } catch {
+    threw = true;
+  }
+  ok('touch(): unknown id does not throw', !threw);
+  eq('touch(): unknown id returns false', result, false);
+}
+
+// --- resultChars / formatJobList: (19) 0 for pending/running/failed, result.length for completed ---
+let charsSummaries;
+{
+  const store = new JobStore(DEFAULT_OPTS);
+  const owner = 'session-chars';
+  const pendingId = store.create(owner, 'custom_prompt');
+  const runningId = store.create(owner, 'custom_prompt');
+  store.markRunning(runningId);
+  const failedId = store.create(owner, 'custom_prompt');
+  store.markRunning(failedId);
+  store.markFailed(failedId, 'boom');
+  const completedId = store.create(owner, 'custom_prompt');
+  store.markRunning(completedId);
+  store.markCompleted(completedId, 'twelve chars');
+
+  charsSummaries = store.list(owner);
+  const byId = Object.fromEntries(charsSummaries.map((s) => [s.id, s]));
+  eq('resultChars: pending job is 0', byId[pendingId].resultChars, 0);
+  eq('resultChars: running job is 0', byId[runningId].resultChars, 0);
+  eq('resultChars: failed job is 0', byId[failedId].resultChars, 0);
+  eq('resultChars: completed job equals result.length', byId[completedId].resultChars, 'twelve chars'.length);
+}
+
+// --- resultChars / formatJobList: (20) chars column renders without the literal string "undefined" ---
+{
+  const listOutput = formatJobList(charsSummaries, Date.now());
+  ok('formatJobList: chars column never renders the literal "undefined"', !listOutput.includes('undefined'));
+  ok('formatJobList: header includes the chars column', listOutput.includes('chars'));
 }
 
 process.stdout.write(failed ? `\n${failed} FAILED\n` : '\nAll job-store tests passed\n');

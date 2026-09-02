@@ -50,6 +50,28 @@
  * result. Throwing here instead would turn a harmless race into an
  * unhandled rejection in the job runner's background execution, which is
  * exactly the failure mode phase 13 exists to avoid.
+ *
+ * Phase 14-1 ("output-side chunking"): `jobs get` returning a huge result
+ * in one response just moves phase 13's original payload-limit problem
+ * from the input side to the output side. `sliceResult`/
+ * `formatJobChunkFooter` below let index.ts return a completed job's
+ * result across several `jobs get` calls instead of one. They operate in
+ * UTF-16 code units (`.length`/`.slice()`'s native unit) rather than
+ * `truncateResult`'s code-point counting above — `sliceResult` runs on
+ * every chunked `get`, so it needs to stay O(1)/O(chunk), not O(n) over
+ * the whole result via `Array.from()` — and instead adjust the requested
+ * window at its edges so it never bisects a UTF-16 surrogate pair (see
+ * `sliceResult`'s doc comment for the exact steps). The extraction
+ * contract this produces — "the first `end - start` characters of the
+ * response are the chunk body, the rest is the footer" — exists because
+ * that boundary adjustment means the actual `start`/`end` reached can
+ * differ from the `offset`/`limit` the caller asked for; a caller that
+ * tried to compute its own next `offset` by arithmetic could drift off by
+ * one instead of following the footer's literal `Next` value.
+ * `JobStore.touch()` (below) exists alongside this because a job being
+ * paged through one chunk at a time can easily outlive the TTL window
+ * that's measured from its *completion* time — see that method's doc
+ * comment for why it's a separate method rather than folded into `get()`.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -104,6 +126,18 @@ export interface JobSummary {
   state: JobState;
   createdAt: number;
   lastUsedAt: number;
+  /**
+   * Length of the stored result body, in UTF-16 code units — 0 for
+   * pending/running/failed jobs, which have no `result` (phase 14-1: lets
+   * a caller decide, before calling `get`, whether a completed job's
+   * result is large enough to arrive in multiple chunks). This is a
+   * character count only, not the content itself, so it doesn't reopen
+   * the "structurally unavailable" leak `formatJobList`'s doc comment
+   * describes below. It also doesn't distinguish "not yet completed" from
+   * "completed with an empty result" — both report 0 — callers needing
+   * that distinction already have `state` for it.
+   */
+  resultChars: number;
 }
 
 function toRecord(entry: JobEntry): JobRecord {
@@ -119,7 +153,14 @@ function toRecord(entry: JobEntry): JobRecord {
 }
 
 function toSummary(entry: JobEntry): JobSummary {
-  return { id: entry.id, tool: entry.tool, state: entry.state, createdAt: entry.createdAt, lastUsedAt: entry.lastUsedAt };
+  return {
+    id: entry.id,
+    tool: entry.tool,
+    state: entry.state,
+    createdAt: entry.createdAt,
+    lastUsedAt: entry.lastUsedAt,
+    resultChars: entry.result?.length ?? 0,
+  };
 }
 
 /**
@@ -134,6 +175,164 @@ function truncateResult(text: string, maxChars: number): string {
   const codepoints = Array.from(text);
   if (codepoints.length <= maxChars) return text;
   return `${codepoints.slice(0, maxChars).join('')} [truncated]`;
+}
+
+/** True if `code` is a UTF-16 high (leading) surrogate. */
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+/** True if `code` is a UTF-16 low (trailing) surrogate. */
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * A window into a job's result body, in UTF-16 code units — the same unit
+ * `.length`/`.slice()` use, so `resultChars` (below) and `total` here stay
+ * O(1) and consistent with each other. `end` is exclusive, matching
+ * `text.slice(start, end)`.
+ *
+ * `start`/`end` are NOT guaranteed to equal the `offset`/`limit` the
+ * caller requested — `sliceResult()` adjusts them to avoid bisecting a
+ * UTF-16 surrogate pair (see that function's doc comment). This is why
+ * `formatJobChunkFooter` hands the caller the *actual* `end` reached
+ * rather than expecting it to compute `offset + limit` itself: the
+ * extraction contract is "the first `end - start` characters of the
+ * response text are the chunk body, the remainder is the footer" — the
+ * caller never needs to know the adjusted `start` on its own.
+ */
+export interface JobResultSlice {
+  text: string;
+  start: number;
+  end: number;
+  total: number;
+}
+
+/**
+ * Extract a window of `text` for chunked `jobs get` retrieval (phase 14-1),
+ * clamping out-of-range `offset`/`limit` and adjusting the window so it
+ * never bisects a UTF-16 surrogate pair (e.g. an emoji) — `text.slice()`
+ * alone would happily split one, leaving an unpaired surrogate in the
+ * returned chunk.
+ *
+ * Runs five fixed steps, in this order (S1–S5 in the phase 14-1 decision
+ * record — `.claude/phases/phase14-mcp-payload-blobs.md`'s フェーズ14-1
+ * section is authoritative; this comment is a restatement, not the source):
+ *
+ *   S1. Clamp `offset`/`limit` into a starting `start` and a window `span`.
+ *       Never throws on bad input — `offset`/`limit` come straight from an
+ *       MCP tool call's arguments, which is exactly the kind of
+ *       caller-typo-prone input this function exists to absorb, not reject.
+ *   S2. If `start` lands on the low half of a surrogate pair, step it back
+ *       one code unit so the chunk begins at the pair's high half. This
+ *       only fires when a caller supplies an `offset` mid-pair by hand
+ *       (ignoring `formatJobChunkFooter`'s `Next.offset`, which always
+ *       lands on a boundary S4 already cleared) — the resulting chunk then
+ *       overlaps the previous one by one code unit. Overlap-over-corruption
+ *       is the intended tradeoff: never emitting a half surrogate outranks
+ *       never repeating one.
+ *   S3. Compute `end = start + span`, clamped to `total`, from the `start`
+ *       S2 may have moved.
+ *   S4. If `end` lands on the low half of a pair, step it back one code
+ *       unit so the pair goes to the *next* chunk instead of being split.
+ *   S5. S4 can leave `end === start` when the window opened exactly on a
+ *       pair's high half with a 1-unit `span` (`limit: 1`) — stepping `end`
+ *       forward by 1 in that case would land back on the same low
+ *       surrogate S4 just backed away from (still mid-pair, still no
+ *       progress). Instead this step grants the *whole* pair
+ *       (`end = min(start + 2, total)`), the only way to guarantee
+ *       `end > start` (see the invariant below) without reintroducing the
+ *       split S4 exists to prevent. A caller that repeatedly asks for
+ *       `limit: 1` against surrogate-pair text will therefore see
+ *       2-character chunks there, not 1 — an intentional, documented
+ *       exception to "you get at most `limit` characters", chosen over the
+ *       alternative of never making progress.
+ *
+ * Invariant, true for every return value (and load-bearing for a caller
+ * paging in a loop off `Next.offset` until it sees a "final chunk"
+ * footer): `0 <= start <= end <= total`, and whenever `start < total`,
+ * `end > start` — every call that isn't already at the end of the text
+ * makes forward progress. Isolated surrogates (a lone high or low
+ * surrogate with no partner — already-malformed input, not something this
+ * function creates) are left untouched by S2/S4/S5: the "is this code unit
+ * part of a pair" check requires *both* halves to be present, so an
+ * isolated surrogate never matches it.
+ */
+export function sliceResult(text: string, offset: number | undefined, limit: number | undefined, ceiling: number): JobResultSlice {
+  const total = text.length;
+
+  // S1: clamp offset -> start.
+  let start: number;
+  if (offset === undefined || !Number.isFinite(offset)) {
+    start = 0;
+  } else {
+    start = Math.floor(offset);
+    if (start < 0) start = 0;
+  }
+  if (start > total) start = total;
+
+  // S1: clamp limit -> span, the window width to apply from `start`.
+  let span: number;
+  if (limit === undefined || !Number.isFinite(limit) || limit <= 0) {
+    span = ceiling > 0 ? ceiling : total - start;
+  } else {
+    span = Math.floor(limit);
+    if (ceiling > 0 && span > ceiling) span = ceiling;
+  }
+
+  // S2: don't start mid-pair.
+  if (start > 0 && start < total && isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))) {
+    start -= 1;
+  }
+
+  // S3: window from the (possibly S2-adjusted) start.
+  let end = Math.min(start + span, total);
+
+  // S4: don't end mid-pair — push the pair into the next chunk instead.
+  if (start < end && end < total && isLowSurrogate(text.charCodeAt(end)) && isHighSurrogate(text.charCodeAt(end - 1))) {
+    end -= 1;
+  }
+
+  // S5: degenerate case — S4 left no progress. Grant the whole pair rather
+  // than split it (see the doc comment above; `end += 1` here would still
+  // land mid-pair and stall forward progress).
+  if (end === start && start < total) {
+    end = Math.min(start + 2, total);
+  }
+
+  return { text: text.slice(start, end), start, end, total };
+}
+
+/**
+ * Render the footer appended after a chunked `jobs get` result (phase
+ * 14-1). This is a machine-readable instruction line for the calling LLM,
+ * not decorative text — its exact wording is a fixed contract asserted by
+ * unit tests (scripts/test-job-store.mjs), so don't reword it casually.
+ *
+ * Extraction contract: the response text's first `slice.end - slice.start`
+ * characters are the chunk body; everything from this footer's leading
+ * `\n\n` onward is metadata. A caller must not compute the next `offset`
+ * itself — `slice.start`/`slice.end` can differ from the `offset`/`limit`
+ * it originally requested (see `sliceResult`'s doc comment) — it copies
+ * `Next` verbatim into its following `jobs get` call instead.
+ *
+ * `limit` is the caller-visible request size to echo back in `Next.limit`
+ * for the *next* chunk — not necessarily `slice.end - slice.start` (which
+ * can be one character larger than requested, per `sliceResult`'s S5) or
+ * `slice.total - slice.end` (the true remainder). Repeating the same
+ * nominal size keeps successive chunks a consistent requested width
+ * despite `sliceResult`'s ±1 boundary adjustments; index.ts (phase 14-1b)
+ * is responsible for choosing the value passed here.
+ */
+export function formatJobChunkFooter(id: string, slice: JobResultSlice, limit: number): string {
+  if (slice.start === slice.end) {
+    return `\n\n--- job result chunk: chars ${slice.start}-${slice.end} of ${slice.total} (end-exclusive, empty: offset is at or beyond end of result) ---`;
+  }
+  if (slice.end >= slice.total) {
+    return `\n\n--- job result chunk: chars ${slice.start}-${slice.end} of ${slice.total} (end-exclusive, end of result) ---`;
+  }
+  return `\n\n--- job result chunk: chars ${slice.start}-${slice.end} of ${slice.total} (end-exclusive) ---\nNext: ${JSON.stringify({ action: 'get', id, offset: slice.end, limit })}`;
 }
 
 export class JobStore {
@@ -209,6 +408,27 @@ export class JobStore {
     const entry = this.entries.get(id);
     if (!entry || entry.owner !== owner) return false;
     return this.entries.delete(id);
+  }
+
+  /**
+   * Update `lastUsedAt` for a job without changing its state — used when a
+   * caller pages through a large completed result via `jobs get`'s
+   * offset/limit (phase 14-1), so a job still being read isn't swept by
+   * TTL or evicted by `maxJobs` overflow mid-pagination. Deliberately not
+   * folded into `get()`: a plain status poll (a `get()` with no
+   * offset/limit) should not extend a job's lifetime — only an actual read
+   * of the result body should.
+   *
+   * Returns true if a job existed for this owner and its timestamp was
+   * updated; false (no-op, no throw) for a missing id or wrong owner,
+   * matching `delete()`'s no-op contract. Does not sweep first — sweeping
+   * here could delete the very entry being touched a moment before update.
+   */
+  touch(owner: string, id: string): boolean {
+    const entry = this.entries.get(id);
+    if (!entry || entry.owner !== owner) return false;
+    entry.lastUsedAt = this.options.now();
+    return true;
   }
 
   /** Remove every job owned by `owner`, regardless of state. Returns the count removed. */
@@ -341,7 +561,9 @@ export function formatJobStatus(record: JobRecord, now: number): string {
  * Build the markdown output for the `jobs` tool's `list` action. Takes only
  * `JobSummary` — which has no result/error field — so returning another
  * job's output here isn't a possible bug to introduce later, it's
- * structurally unavailable.
+ * structurally unavailable. The `chars` column (phase 14-1) is
+ * `JobSummary.resultChars` — a length only, not the body itself — so this
+ * stays true even with the column added.
  */
 export function formatJobList(summaries: JobSummary[], now: number): string {
   if (summaries.length === 0) {
@@ -351,11 +573,11 @@ export function formatJobList(summaries: JobSummary[], now: number): string {
   const sorted = [...summaries].sort((a, b) => b.lastUsedAt - a.lastUsedAt);
 
   const lines: string[] = [];
-  lines.push('| job_id | tool | state | age |');
-  lines.push('|---|---|---|---|');
+  lines.push('| job_id | tool | state | age | chars |');
+  lines.push('|---|---|---|---|---|');
   for (const s of sorted) {
     const ageMin = (now - s.createdAt) / 60_000;
-    lines.push(`| ${s.id} | ${s.tool} | ${s.state} | ${formatMinutes(ageMin)} |`);
+    lines.push(`| ${s.id} | ${s.tool} | ${s.state} | ${formatMinutes(ageMin)} | ${s.resultChars} |`);
   }
   lines.push('*Only your own jobs are listed.*');
 
