@@ -17,6 +17,7 @@
     "test:jobs": "node scripts/test-job-store.mjs",
     "test:blobs": "node scripts/test-blob-store.mjs",
     "test:jobs:e2e": "node scripts/test-jobs-e2e.mjs",
+    "test:blobs:e2e": "node scripts/test-blobs-e2e.mjs",
     "test:conversations:e2e": "node scripts/test-conversations-e2e.mjs",
     "test:conversations:stdio": "node scripts/test-conversations-stdio-e2e.mjs",
     "test:progress": "node scripts/test-progress-notifications.mjs",
