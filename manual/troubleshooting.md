@@ -101,6 +101,23 @@ There's nothing to recover - submit a new job with `async: true` rather than ret
 
 **Deliberate scope limit, not a missing feature.** A background job and a server-side conversation turn are two different lifecycles with different ownership and expiry rules, and combining them (an async call that also reads or extends conversation history) isn't supported yet. Use one or the other on a given call: `async: true` alone for a one-off background job, or `start_conversation`/`conversation_id` alone for a synchronous conversational turn.
 
+## "context and context_blob_id cannot both be set"
+
+**Deliberate exclusivity, not a bug.** `context_blob_id` supplies `custom_prompt`'s context out-of-band from a sealed blob — it's a substitute for `context`, not an addition to it, so sending both in the same call is redundant and rejected outright. Drop whichever one you don't mean. The same applies to `context_blob_id` alongside `start_conversation`/`conversation_id` — that combination isn't supported yet either (a scope limit, not a technical wall — see the previous entry on `async` for the same pattern).
+
+## blobs append/seal is rejected
+
+A few distinct causes, each with its own wording (unlike the not-found error below, these aren't deliberately unified, so the message itself tells you which one you hit):
+
+- **`chunk seq mismatch`** — chunks must arrive in order starting at `seq: 0`. The error names the `seq` it expected; retry with that value rather than the one you sent. The blob is left completely unchanged on this error, so retrying costs nothing.
+- **`blob ... is already sealed`** — you called `append` (or `seal` again) on a blob that's already `sealed`. Once sealed, a blob is closed to further writes; start a new one if you have more data to send.
+- **the server's global blob capacity is full** — `HOUTINI_LM_BLOB_MAX` (default 20) or `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS` (default 8,000,000) has been hit, across every owner combined, with no per-owner quota. Delete a blob you no longer need, or wait for the idle TTL (`HOUTINI_LM_BLOB_TTL_MIN`, default 30 minutes) to reclaim space automatically.
+- **a per-blob size error** — the single blob you're appending to would exceed `HOUTINI_LM_BLOB_MAX_CHARS` (default 2,000,000). Split the upload across more, smaller blobs instead.
+
+## jobs get's result looks cut off partway through
+
+**That's automatic chunking, not truncation.** A `completed` result past `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` (default 50,000 characters) is split into pieces rather than returned all at once — the response you got is the first chunk, followed by a footer telling you how far it got and a `Next` object for the following call. Copy that `Next` object verbatim into your next `jobs get` rather than guessing the next `offset` yourself — see [Large payloads (blobs)](../README.md#large-payloads-blobs) in the README. If you'd rather have the old always-return-everything behaviour back, set `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS=0` (this only disables *automatic* chunking; an explicit `offset`/`limit` still chunks on request).
+
 ## Where to look when none of this fits
 
 The server logs everything interesting to **stderr** (stdout is the MCP transport and stays clean - any log line you see mixed into responses is a bug, report it). In Claude Desktop, the MCP log files capture stderr per server: look for `[houtini-lm]` lines - budget overrides, thinking-mode decisions, retry attempts and lock waits are all narrated there. Failing that, the [issues page](https://github.com/houtini-ai/houtini-lm/issues) - a footer, the stderr lines, and your backend's version is usually enough to diagnose anything.

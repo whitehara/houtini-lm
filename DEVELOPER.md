@@ -19,13 +19,22 @@ src/
   job-store.ts        In-memory, TTL-bounded store for background jobs
                       submitted via custom_prompt/code_task_files' async:
                       true (phase 13) — mirrors conversation-store.ts's
-                      design (no timers, lazy TTL sweep, owner-scoped access)
+                      design (no timers, lazy TTL sweep, owner-scoped access).
+                      Also implements the output-side chunking for jobs get's
+                      offset/limit (phase 14-1)
+  blob-store.ts       In-memory, TTL-bounded store for chunked payload upload
+                      (phase 14-2/14-3) — the input-side counterpart to
+                      job-store.ts's output-side chunking. open/sealed state
+                      machine, ordered-chunk append, whole-body sha256 at
+                      seal, hard-reject overflow (no soft eviction, unlike
+                      job-store.ts). Wired into the blobs tool and
+                      custom_prompt's context_blob_id
 server.json           MCP registry manifest
 scripts/test.mjs      Direct-client integration tests (hits /v1 endpoints)
 scripts/test-mcp-e2e.mjs End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
 scripts/benchmark.mjs Throughput + savings benchmark
-scripts/shakedown.mjs End-to-end self-test — runs 7 of the 10 tools in sequence (all except stats, conversations, and jobs)
+scripts/shakedown.mjs End-to-end self-test — runs 7 of the 11 tools in sequence (all except stats, conversations, jobs, and blobs)
 docs/SHAKEDOWN.md     Canonical test prompt (for running via Claude chat)
 scripts/add-shebang.mjs Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
@@ -321,7 +330,7 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 ## Testing
 
-Eleven independent test harnesses, each with a different scope:
+Thirteen independent test harnesses, each with a different scope:
 
 - **`scripts/test.mjs`** — **direct-client** integration test. Hits the provider's
   `/v1/*` endpoints without going through the MCP server. Good for
@@ -338,7 +347,7 @@ Eleven independent test harnesses, each with a different scope:
   override.
 - **`scripts/benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`scripts/shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs 7 of the 10 tools end-to-end (all except `stats`, `conversations`, and `jobs`) and prints a summary table with TTFT, tok/s,
+  Runs 7 of the 11 tools end-to-end (all except `stats`, `conversations`, `jobs`, and `blobs`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
 - **`scripts/test-conversation-store.mjs`** (`npm run test:conversations`) —
@@ -361,8 +370,19 @@ Eleven independent test harnesses, each with a different scope:
   async jobs over HTTP**. Spawns `dist/index.js` against
   `fake-openai-backend.mjs` and drives `async: true` submission, `jobs`
   `get`/`list`/`delete`, `wait_ms` polling, the active-jobs-per-owner limit,
-  result truncation, and the `HOUTINI_LM_JOBS=0` disabled path through real
-  tool calls.
+  result truncation, the output-side `offset`/`limit` chunking (phase 14-1),
+  and the `HOUTINI_LM_JOBS=0` disabled path through real tool calls.
+- **`scripts/test-blob-store.mjs`** (`npm run test:blobs`) — **unit** test for
+  `BlobStore` and `formatBlobCreated`/`formatBlobAppended`/`formatBlobList`.
+  Pure logic, no backend or built server needed — mirrors
+  `test-job-store.mjs`'s scope and structure.
+- **`scripts/test-blobs-e2e.mjs`** (`npm run test:blobs:e2e`) — **end-to-end
+  blobs over HTTP**. Spawns `dist/index.js` against `fake-openai-backend.mjs`
+  and drives the `blobs` tool's five actions, owner isolation, the
+  `HOUTINI_LM_BLOBS=0` disabled path, session-close cleanup, and
+  `custom_prompt`'s `context_blob_id` (including a byte-identity check
+  against the same input passed directly as `context`) through real tool
+  calls.
 - **`scripts/test-http-transport.mjs`** (`npm run test:http`) — verifies the
   Streamable HTTP transport itself: session lifecycle, `tools/list`,
   `tools/call` with progress notifications routed to the correct session,

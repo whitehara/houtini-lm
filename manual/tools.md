@@ -1,6 +1,6 @@
 # The tools, in depth
 
-Ten tools. Five do inference, three tell you about the setup, one manages server-side conversations, and one manages background jobs. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
+Eleven tools. Five do inference, three tell you about the setup, one manages server-side conversations, one manages background jobs, and one manages chunked payload uploads. This page is the reference for all of them - what each one's for, the parameters that matter, and how to read what comes back. If you want the philosophy of *what to hand off and how to brief it*, that's [delegation.md](delegation.md).
 
 ## chat
 
@@ -39,6 +39,8 @@ Also accepts `include_reasoning` and `force_thinking` (both default `false`) - s
 When you're continuing a conversation, `context` gets special treatment: it's only recorded into the stored history the first time you send it for that `conversation_id`, so resending the same block on every call is safe and won't duplicate it. That's the recommended habit, in fact - if a long conversation ever trims `context` out of its retained history, resending it puts it straight back.
 
 Also accepts `async` (default `false`) - submit as a background job instead of waiting inline; see [Async jobs](../README.md#async-jobs) in the README. Cannot be combined with `start_conversation`/`conversation_id`.
+
+Also accepts `context_blob_id` - use a sealed blob (created with the `blobs` tool) as `context` instead of pasting it inline, for input too large to send in one MCP call. Substituted verbatim for `context`; sending both in the same call is an error, and it cannot currently be combined with `start_conversation`/`conversation_id` either. Pairing it with `async: true` is the intended way to submit input too large or too slow to process synchronously. See [Large payloads (blobs)](../README.md#large-payloads-blobs) in the README.
 
 ## code_task
 
@@ -93,9 +95,21 @@ Not in the tool list at all if the server's running with `HOUTINI_LM_CONVERSATIO
 
 Housekeeping for the background jobs `custom_prompt` and `code_task_files` can start with `async: true` - see [Async jobs](../README.md#async-jobs) in the README for how those work, including the same ownership boundary `conversations` uses. This tool never shows or touches anything you don't own.
 
-Three actions, chosen with the `action` parameter: `list` returns a table of your jobs - id, tool, state, submitted time - metadata only, never the result body. `get` (needs `job_id`) returns the full state, and once `completed` or `failed`, the result or error itself; pass `wait_ms` (up to 30,000) to block for the job to finish instead of polling in a tight loop. `delete` (needs `job_id`) forgets the record - it does not cancel a `running` job, which keeps executing against the backend regardless.
+Three actions, chosen with the `action` parameter: `list` returns a table of your jobs - id, tool, state, submitted time, result size in chars - metadata only, never the result body. `get` (needs `job_id`) returns the full state, and once `completed` or `failed`, the result or error itself; pass `wait_ms` (up to 30,000) to block for the job to finish instead of polling in a tight loop. `delete` (needs `job_id`) forgets the record - it does not cancel a `running` job, which keeps executing against the backend regardless.
+
+`get` also accepts `offset`/`limit` to page through a large result instead of getting it all at once. A `completed` result past `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` (default 50,000 chars) is automatically chunked this way even without asking - the response carries a `Next` footer telling you exactly what to pass on the following call. Copy it verbatim rather than computing the next offset yourself. A `failed` job's `error` is always returned whole, never chunked.
 
 Not in the tool list at all if the server's running with `HOUTINI_LM_JOBS=0`.
+
+## blobs
+
+Housekeeping for chunked payload uploads - the input-side counterpart to `jobs`' output-side chunking above. Lets you send a prompt too large for one MCP call in ordered pieces, then reference the assembled result by id instead of pasting it inline. See [Large payloads (blobs)](../README.md#large-payloads-blobs) in the README for the full workflow.
+
+Five actions, chosen with the `action` parameter: `create` starts a new blob, optionally with `data` as its first chunk. `append` (needs `blob_id`, `seq`, `data`) adds the next chunk - chunks must arrive in order starting at `seq: 0`, or the call is rejected and the blob is left unchanged. `seal` (needs `blob_id`) closes the blob to further appends and computes its sha256 over the full assembled body - optionally pass `sha256` to verify it against your own digest. `list` returns a table of your blobs - id, state (`open`/`sealed`), chunk count, chars, idle time, expiry - metadata only, never the body. `delete` (needs `blob_id`) removes the record.
+
+50,000 characters per chunk is the recommended `append` size - measured safe over the production MCP path. A sealed blob's id becomes `custom_prompt`'s `context_blob_id`.
+
+Not in the tool list at all if the server's running with `HOUTINI_LM_BLOBS=0`.
 
 ## Reading the footer
 

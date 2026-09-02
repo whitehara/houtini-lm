@@ -32,7 +32,7 @@ This README is the overview. The depth lives in focused pages:
 | Page | What's in it |
 |---|---|
 | [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
-| [The tools, in depth](./manual/tools.md) | All ten tools: the parameters that matter, reading the footer, the max_tokens floor |
+| [The tools, in depth](./manual/tools.md) | All eleven tools: the parameters that matter, reading the footer, the max_tokens floor |
 | [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
 | [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
 | [LM Studio setup](./docs/SETUP-LMSTUDIO.md) · [Ollama setup](./docs/SETUP-OLLAMA.md) · [vLLM setup](./docs/SETUP-VLLM.md) | Backend guides, each with the traps that cause silent failures |
@@ -442,12 +442,34 @@ Manage background jobs submitted with `async: true` on `custom_prompt` or `code_
 | `action` | yes | - | `list`, `get`, or `delete`. |
 | `job_id` | required for `get`/`delete` | - | Which job to look up or remove. Ignored for `list`. |
 | `wait_ms` | no | `0` | For `get` only: instead of returning the job's current state immediately, block up to this many milliseconds for it to finish, then return whatever state it's in. Clamped to 30,000. Use this to poll without hammering the tool. |
+| `offset` | no | - | For `get` on a `completed` job only: 0-based character offset into the result to start returning from. Omit for the default behaviour below. |
+| `limit` | no | - | For `get` on a `completed` job only: max characters to return starting at `offset`. Omit for the default behaviour below. |
 
-- **`list`** — a markdown table of your jobs: id, tool, state, submitted time. Metadata only — never the result body.
-- **`get`** — full detail for one job: state (`pending`, `running`, `completed`, `failed`), and once `completed` or `failed`, the result or error. A `completed` job's result is byte-identical to what the equivalent synchronous call would have returned, aside from truncation under `HOUTINI_LM_JOB_MAX_RESULT_CHARS`. An id that never existed and an id owned by someone else return the *exact same* error, for the same reason `conversations`' `delete` does.
+- **`list`** — a markdown table of your jobs: id, tool, state, submitted time, and result size in characters (`0` until the job completes). Metadata only — never the result body.
+- **`get`** — full detail for one job: state (`pending`, `running`, `completed`, `failed`), and once `completed` or `failed`, the result or error. A `completed` job's result is byte-identical to what the equivalent synchronous call would have returned, aside from truncation under `HOUTINI_LM_JOB_MAX_RESULT_CHARS` — **unless** it exceeds `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` (default 50,000 characters), in which case it's automatically split: the response carries only the first chunk plus a trailing footer telling you how to fetch the rest. Passing `offset`/`limit` explicitly always chunks the same way, even under the inline threshold. Either way, **don't compute the next `offset` yourself** — copy the footer's `Next` object verbatim into your following `jobs get` call. A `failed` job's `error` is always returned in full, never chunked. An id that never existed and an id owned by someone else return the *exact same* error, for the same reason `conversations`' `delete` does.
 - **`delete`** — removes one job by `job_id`. This only forgets the job record; it does **not** cancel in-flight inference — a `running` job keeps running against the backend, it just stops being retrievable.
 
 See [Async jobs](#async-jobs) below for the full picture.
+
+### `blobs`
+
+Upload a large prompt in chunks, working around the MCP transport's per-request body ceiling — the input-side counterpart to `jobs get`'s output-side chunking above. Scoped strictly to the blobs you own, the same way `conversations` is scoped to your conversations — see [Isolation boundary](#server-side-conversations). Not listed in `tools/list` at all when `HOUTINI_LM_BLOBS` is disabled.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `action` | yes | - | `create`, `append`, `seal`, `list`, or `delete`. |
+| `blob_id` | required for `append`/`seal`/`delete` | - | Which blob to add to, close, or remove. Ignored for `create` and `list`. |
+| `seq` | required for `append` | - | 0-based chunk sequence number — chunks must arrive in order starting at 0. |
+| `data` | optional for `create`, required for `append` | - | The chunk text. `create` may include the first chunk (seq 0) directly; a later `append` always supplies the next one. |
+| `sha256` | optional, `seal` only | - | A 64-character lowercase hex sha256 digest of the full assembled body — if given, verified against the computed digest and rejected on mismatch. |
+
+- **`create`** — starts a new blob, optionally with `data` as its first chunk.
+- **`append`** — adds the next chunk. Chunks must arrive in order starting at seq 0; an out-of-order `seq` is rejected and the blob is left unchanged.
+- **`seal`** — closes the blob to further appends and computes its sha256 over the full assembled body. Required before the blob can be used anywhere (an open blob can't be read).
+- **`list`** — a markdown table of your blobs: id, state (`open`/`sealed`), chunk count, chars, idle time, time to expiry. Metadata only — body content is never returned, and structurally can't be, since `list` works from a summary type that has no body field.
+- **`delete`** — removes one blob's record.
+
+50,000 characters per chunk is the recommended size (measured safe over the production MCP path). See [Large payloads (blobs)](#large-payloads-blobs) below for the full picture, including how to use a sealed blob as `custom_prompt`'s `context_blob_id`.
 
 ## Server-side conversations
 
@@ -509,6 +531,56 @@ Poll with jobs get, job_id: "7f3a1c2e-...". Result kept for 60min after completi
 
 **Turning it off** — set `HOUTINI_LM_JOBS=0` (also accepts `false`/`no`/`off`) and `async` disappears from `custom_prompt`'s and `code_task_files`'s schemas entirely, and the `jobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call. This is also the fastest way to fall back to fully synchronous behaviour without rolling back the image.
 
+## Large payloads (blobs)
+
+The [`blobs`](#blobs) tool lets a caller upload a prompt too large for a single MCP `tools/call` body, in ordered chunks, then reference the assembled result by id instead of pasting it inline — the input-side counterpart to `jobs get`'s output-side chunking above.
+
+**Submitting** — call `blobs` with `action: "create"` (optionally including the first chunk as `data`), then one or more `action: "append"` calls with `seq` incrementing from 0, then `action: "seal"` once the whole body has been sent:
+
+```
+📦 Blob 3f9a1c2e-... created — 0 chars in 0 chunk(s). Send the next chunk with blobs append, blob_id: "3f9a1c2e-...", seq: 0. Seal it with blobs seal when done. Idle-expires in 30min.
+📦 Blob 3f9a1c2e-... — chunk 0 accepted, 50000 chars in 1 chunk(s). Next chunk: seq 1, or seal with blobs seal. Idle-expires in 30min.
+📦 Blob 3f9a1c2e-... sealed — 82340 chars in 2 chunk(s), sha256 4f8b2a.... Use it with custom_prompt's context_blob_id: "3f9a1c2e-...". Idle-expires in 30min.
+```
+
+50,000 characters per chunk is the recommended size (measured safe over the production MCP path — see the limits table below). Sealing is required before the blob can be used anywhere: reading an unsealed blob is refused outright, so a caller can never accidentally feed a still-in-progress upload to inference.
+
+**Retrieving** — pass the sealed blob's id as `custom_prompt`'s `context_blob_id` instead of pasting the text into `context` directly; the blob's full body is substituted verbatim. Pairing this with `async: true` is the primary intended use, since a large blob's prompt-processing time can exceed the ~180s synchronous call budget — submit the job, then poll it with [`jobs`](#jobs):
+
+```
+create blobs chunks... -> seal -> custom_prompt({ context_blob_id: "3f9a1c2e-...", async: true, ... })
+  -> 🚀 Job 7f3a1c2e-... submitted ...
+  -> jobs get, job_id: "7f3a1c2e-...", wait_ms: 30000 (repeat until completed)
+  -> if the result itself is large, jobs get with offset/limit — or just follow the Next footer
+```
+
+**Three limits, easy to conflate — a quick reference:**
+
+| Limit | Env var | Default | Side | What it bounds |
+|-------|---------|---------|------|-----------------|
+| Recommended chunk size | *(none — a `blobs append` usage guideline, not enforced)* | 50,000 chars | Input | How much text to send per `blobs append` call |
+| Inline result threshold | `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` | 50,000 chars | Output | How much of a completed job's result `jobs get` returns before auto-chunking kicks in |
+| Retained result cap | `HOUTINI_LM_JOB_MAX_RESULT_CHARS` | 200,000 chars | Output | How much of a completed job's result is kept server-side at all (past this, the result itself is truncated, independent of chunking) |
+
+`HOUTINI_LM_BLOB_MAX_CHARS` (default 2,000,000) and `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS` (default 8,000,000) are separate again — per-blob and global-across-all-owners caps on how much a blob may hold at all, not chunk-size limits.
+
+**Isolation boundary** — the same two modes as [conversations](#server-side-conversations) and [jobs](#async-jobs), selected by whether `HOUTINI_LM_CONVERSATION_OWNER_HEADER` is set:
+
+- **Unset (default)** — a blob belongs to the MCP connection that created it. Over HTTP, sending `DELETE` on the MCP session immediately discards every blob owned by that session, same as it does for conversations and jobs.
+- **Set** — a blob belongs to the named header's value instead, so it survives across MCP sessions/connections for the same authenticated caller. A session `DELETE` no longer discards it — only `blobs delete` and the idle TTL do.
+
+**Known limitations** — this is a lightweight, in-memory upload buffer, not durable storage:
+- Everything is lost on a process restart or redeploy, including blobs mid-upload (`open`, not yet `seal`ed). Nothing is persisted to disk.
+- `deploy.replicas` must stay at `1` — the blob store is in-memory and per-process, exactly like conversations and jobs.
+- Unlike conversations and jobs, the idle TTL (`HOUTINI_LM_BLOB_TTL_MIN`, default 30 minutes) applies even to a blob that's still `open` (mid-upload) — an abandoned upload is reclaimed rather than kept forever.
+- `context_blob_id` cannot be combined with `context`, `start_conversation`, or `conversation_id` — a blob is a substitute for `context`, not an addition to it, and combining it with server-side conversations is out of scope for now.
+- Using `context_blob_id` together with `async: true` keeps the blob's text resident twice for the life of the job — once in the blob store, once in the job's own closure — up to roughly double `HOUTINI_LM_BLOB_MAX_CHARS` per job. This isn't counted against `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS`.
+- If the assembled prompt is still too large for the target model's own context window, the usual context-overflow handling applies — a blob only raises the *transport's* body-size ceiling, never the model's. On an overflow, the existing self-healing retry re-sends the *entire* (very large) prompt a second time before giving up, so a chronically oversized blob costs roughly double the usual failed-call overhead; keep blobs sized to what your target model can actually hold.
+- The per-blob and global caps (`HOUTINI_LM_BLOB_MAX_CHARS`, `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS`, `HOUTINI_LM_BLOB_MAX`) are shared across every owner with no per-owner quota — a single busy caller can in principle fill the global budget and cause other callers' `blobs create`/`append` to fail with a capacity error until idle blobs expire or are deleted. Mitigated only by the idle TTL and explicit `delete`, not by any per-owner fairness mechanism.
+- The empirical safe ceiling for a *single* MCP request's body size (as opposed to the recommended 50,000-character chunk size above) has not been fully measured — 50,000 characters is a conservative, tested-safe recommendation, not a hard protocol limit.
+
+**Turning it off** — set `HOUTINI_LM_BLOBS=0` (also accepts `false`/`no`/`off`) and `context_blob_id` disappears from `custom_prompt`'s schema entirely, and the `blobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call.
+
 ## Structured JSON output
 
 Both `chat` and `custom_prompt` accept a `json_schema` parameter that forces the response to conform to a JSON Schema. LM Studio uses grammar-based sampling to guarantee valid output - no hoping the model remembers to close its brackets.
@@ -563,7 +635,7 @@ The canonical way to verify an install and get an honest read on what the loaded
 npm run shakedown
 ```
 
-This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the ten tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats`, `conversations`, and `jobs` are not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the eleven tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats`, `conversations`, `jobs`, and `blobs` are not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
 
 Sample output tail:
 
@@ -670,6 +742,12 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_JOB_CONCURRENCY` | `1` | Max jobs actually running inference at once, across all owners. Extra submissions queue as `pending`. |
 | `HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN` | `15` | Per-job soft timeout, in minutes — same mechanism as the server's own [soft timeout](#streaming-and-timeouts), applied per job instead of per request. |
 | `HOUTINI_LM_JOB_MAX_RESULT_CHARS` | `200000` | Max characters kept for a completed job's result. A result longer than this is truncated before being stored. |
+| `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` | `50000` | Max characters of a completed job's result `jobs get` returns inline before automatic chunking kicks in. Set to `0` to disable automatic chunking only — explicit `offset`/`limit` requests still work and still chunk. See [Large payloads (blobs)](#large-payloads-blobs) for how this differs from the two limits below. |
+| `HOUTINI_LM_BLOBS` | `1` (on) | Enables the `blobs` tool and `context_blob_id` on `custom_prompt`. Set to `0` (also accepts `false`/`no`/`off`) to disable — both disappear from the schema entirely rather than being present and erroring. Also doubles as a production kill switch. See [Large payloads (blobs)](#large-payloads-blobs). |
+| `HOUTINI_LM_BLOB_TTL_MIN` | `30` | Idle-expiry window for a blob, in minutes, measured from its last create/append/seal/read. Applies to both `open` and `sealed` blobs. |
+| `HOUTINI_LM_BLOB_MAX` | `20` | Max blobs held at once, across all owners, `open`+`sealed` combined. |
+| `HOUTINI_LM_BLOB_MAX_CHARS` | `2000000` | Max characters a single blob's body may hold. |
+| `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS` | `8000000` | Max characters across all owners' blob bodies combined, `open`+`sealed`. |
 
 **Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 
