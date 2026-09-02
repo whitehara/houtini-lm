@@ -61,6 +61,13 @@ import {
   type JobTool,
   type JobRecord,
 } from './job-store.js';
+import {
+  BlobStore,
+  formatBlobCreated,
+  formatBlobAppended,
+  formatBlobList,
+  type BlobFailure,
+} from './blob-store.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -615,6 +622,72 @@ async function runJob(record: JobRecord, fn: () => Promise<string>): Promise<voi
     jobsRunning--;
     pump();
   }
+}
+
+// ── Chunked payload blobs (blobs tool) ──────────────────────────────
+
+// Phase 14-2/14-3: input-side chunked upload — the counterpart to jobs
+// get's output-side chunking (phase 14-1). A client splits a large prompt
+// into chunks (50,000 chars recommended — see
+// .claude/phases/phase14-mcp-payload-blobs.md's D1c) and uploads them via
+// blobs create/append/seal, then references the sealed blob by id from
+// custom_prompt's context_blob_id (phase 14-3b) to bypass the same
+// single-request-body ceiling that motivated jobs get's chunking. Pure
+// storage/state-machine logic lives in blob-store.ts; this section only
+// owns env config, the BlobStore instance, and the owner-resolution/
+// disabled/not-found/failure-conversion helpers the `blobs` tool case
+// (and, once phase 14-3b wires it up, custom_prompt's context_blob_id)
+// both need. Kept as one contiguous section — rather than splitting
+// pieces out next to resolveJobOwner/JOBS_DISABLED_MESSAGE the way phase
+// 13's jobs feature does — deliberately, so this feature's entire
+// index.ts footprint stays a single reviewable diff hunk.
+//
+// Default on: HOUTINI_LM_BLOBS=0 (or false/no/off) disables the feature
+// entirely — the `blobs` tool is hidden from tools/list (see the
+// conditional spread in TOOLS below) and, once phase 14-3b wires it up,
+// custom_prompt's context_blob_id parameter will be too.
+const BLOBS_ENABLED = !/^(0|false|no|off)$/i.test(process.env.HOUTINI_LM_BLOBS || '');
+// Shorter default than JOB_TTL_MIN (60): a blob is meant to be assembled
+// and consumed within one upload session (create -> append* -> seal ->
+// read), not to persist the way a job's result does.
+const BLOB_TTL_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_BLOB_TTL_MIN || '30', 10) || 30);
+const BLOB_MAX = Math.max(1, parseInt(process.env.HOUTINI_LM_BLOB_MAX || '20', 10) || 20);
+const BLOB_MAX_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_BLOB_MAX_CHARS || '2000000', 10) || 2_000_000);
+const BLOB_MAX_TOTAL_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_BLOB_MAX_TOTAL_CHARS || '8000000', 10) || 8_000_000);
+
+const blobs = new BlobStore({
+  ttlMs: BLOB_TTL_MIN * 60_000,
+  maxBlobs: BLOB_MAX,
+  maxChars: BLOB_MAX_CHARS,
+  maxTotalChars: BLOB_MAX_TOTAL_CHARS,
+});
+
+/** resolveOwnerKey() wrapper for chunked blobs (phase 14-2/14-3) — see that function, below, for the shared resolution logic. A function declaration, so this forward reference (and the ConversationOwner/HoutiniExtra type references below) resolve fine — both are hoisted/type-checked whole-file, not position-dependent. */
+function resolveBlobOwner(extra: HoutiniExtra): ConversationOwner {
+  const r = resolveOwnerKey(extra);
+  if (r.kind === 'owner') return r;
+  const text = r.reason === 'header-unusable'
+    ? 'Error: blobs require an authenticated user header on this server.'
+    : 'Error: blobs require an MCP session.';
+  return { kind: 'error', result: { content: [{ type: 'text', text }], isError: true } };
+}
+
+// Shared verbatim across every `blobs` action that hits the kill switch
+// (see CONVERSATIONS_DISABLED_MESSAGE/JOBS_DISABLED_MESSAGE for the same
+// pattern) — one literal, so the wording can never drift.
+const BLOBS_DISABLED_MESSAGE = 'Error: blobs are disabled on this houtini-lm instance (HOUTINI_LM_BLOBS=0).';
+
+/** "not found or not yours" response for the `blobs` tool's `delete` action only — blobs.read()'s own not_found failure goes through blobFailureResult() below instead (D18), so this helper's wording never has to match blob-store.ts's. Never distinguishes a nonexistent blob_id from one owned by someone else, so a caller can't probe for other owners' blobs. */
+function blobNotFound(id: string): CallToolResult {
+  return {
+    content: [{ type: 'text', text: `Error: blob ${id} not found (it may have expired or the session ended).` }],
+    isError: true,
+  };
+}
+
+/** BlobFailure -> CallToolResult (D18): every BlobStore failure takes this shape, with no branching on `code` — blob-store.ts's `message` is already a complete, `Error: `-prefix-free sentence (see that module's BlobFailure doc comment). */
+function blobFailureResult(r: BlobFailure): CallToolResult {
+  return { content: [{ type: 'text', text: `Error: ${r.message}` }], isError: true };
 }
 
 // ── OpenAI-compatible API helpers ────────────────────────────────────
@@ -3037,6 +3110,58 @@ const TOOLS: Tool[] = [
       required: ['action'],
     },
   }] : []),
+
+  // Only shown when BLOBS_ENABLED — mirrors the conditional spread used
+  // for the jobs tool above (phase 13). A sealed instance hides this tool
+  // entirely rather than exposing it and erroring on every call.
+  ...(BLOBS_ENABLED ? [{
+    name: 'blobs',
+    description:
+      'Upload a large prompt in chunks, working around the MCP transport\'s per-request body ceiling — the ' +
+      'input-side counterpart to jobs get\'s output-side chunking. Workflow: `create` (optionally with the first ' +
+      'chunk of data) -> `append` one or more further chunks in order, starting at seq 0 -> `seal` once the whole ' +
+      'body has been sent. 50,000 characters per chunk is the recommended size (measured safe over the production ' +
+      'MCP path). Once sealed, use the blob\'s id with custom_prompt\'s context_blob_id — pairing that with ' +
+      'async: true is the intended way to submit input too large or too slow to process synchronously. A blob ' +
+      'only bypasses the transport\'s body-size limit — it does NOT enlarge the model\'s own context window; the ' +
+      'assembled text still has to fit whatever model you route to. `list` returns metadata only (id, state, ' +
+      'chunk/char counts, idle/expiry) — never body content. `delete` removes one blob\'s record.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['create', 'append', 'seal', 'list', 'delete'],
+          description:
+            '"create": start a new blob, optionally with `data` as its first chunk (seq 0). ' +
+            '"append": add the next chunk — requires blob_id, seq, and data. ' +
+            '"seal": close the blob to further appends and compute its sha256 — requires blob_id; sha256 is ' +
+            'optional and, if given, verified against the computed digest. ' +
+            '"list": show your blobs (metadata only, no body content). ' +
+            '"delete": remove one blob\'s record — requires blob_id.',
+        },
+        blob_id: {
+          type: 'string',
+          description: 'Required for "append", "seal", and "delete". The id returned when the blob was created.',
+        },
+        seq: {
+          type: 'number',
+          description: '"append" only, required. 0-based chunk sequence number — chunks must arrive in order starting at 0.',
+        },
+        data: {
+          type: 'string',
+          description: '"create": optional first chunk. "append": required, the next chunk to add.',
+        },
+        sha256: {
+          type: 'string',
+          description:
+            '"seal" only, optional. A 64-character lowercase hex sha256 digest of the full assembled body — if ' +
+            'given, verified against the server\'s own computed digest; a mismatch leaves the blob open and unchanged.',
+        },
+      },
+      required: ['action'],
+    },
+  }] : []),
 ];
 
 // ── MCP Server ───────────────────────────────────────────────────────
@@ -4094,6 +4219,83 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         return { content: [{ type: 'text', text: formatJobStatus(record, Date.now()) }] };
       }
 
+      case 'blobs': {
+        if (!BLOBS_ENABLED) {
+          return { content: [{ type: 'text', text: BLOBS_DISABLED_MESSAGE }], isError: true };
+        }
+
+        const { action, blob_id, seq, data, sha256 } = args as {
+          action?: string;
+          blob_id?: string;
+          seq?: number;
+          data?: string;
+          sha256?: string;
+        };
+        if (action !== 'create' && action !== 'append' && action !== 'seal' && action !== 'list' && action !== 'delete') {
+          return {
+            content: [{ type: 'text', text: 'Error: action must be one of "create", "append", "seal", "list", "delete".' }],
+            isError: true,
+          };
+        }
+
+        const ownerResult = resolveBlobOwner(extra);
+        if (ownerResult.kind === 'error') return ownerResult.result;
+        const owner = ownerResult.owner;
+
+        if (action === 'list') {
+          return { content: [{ type: 'text', text: formatBlobList(blobs.list(owner), BLOB_TTL_MIN, Date.now()) }] };
+        }
+
+        if (action === 'create') {
+          if (data !== undefined && typeof data !== 'string') {
+            return { content: [{ type: 'text', text: 'Error: data must be a string for action: "create".' }], isError: true };
+          }
+          const r = blobs.create(owner, data);
+          if (!r.ok) return blobFailureResult(r);
+          return { content: [{ type: 'text', text: formatBlobCreated(r.value, BLOB_TTL_MIN) }] };
+        }
+
+        // action is 'append' | 'seal' | 'delete' from here on — all three require blob_id.
+        if (typeof blob_id !== 'string' || blob_id === '') {
+          return { content: [{ type: 'text', text: `Error: blob_id is required for action: "${action}".` }], isError: true };
+        }
+
+        if (action === 'delete') {
+          // blobs.delete() itself already checks ownership (see
+          // blob-store.ts) and returns false for a missing id, a wrong
+          // owner, or an already-gone blob — collapsed to one response so a
+          // caller can't probe for other owners' blob ids by comparing
+          // error text (same pattern as the jobs tool's delete, above).
+          const existed = blobs.delete(owner, blob_id);
+          if (!existed) return blobNotFound(blob_id);
+          return { content: [{ type: 'text', text: `Deleted blob ${blob_id}.` }] };
+        }
+
+        if (action === 'append') {
+          if (!Number.isInteger(seq) || (seq as number) < 0) {
+            return { content: [{ type: 'text', text: 'Error: seq must be a non-negative integer for action: "append".' }], isError: true };
+          }
+          if (typeof data !== 'string') {
+            return { content: [{ type: 'text', text: 'Error: data is required for action: "append".' }], isError: true };
+          }
+          const r = blobs.append(owner, blob_id, seq as number, data);
+          if (!r.ok) return blobFailureResult(r);
+          return { content: [{ type: 'text', text: formatBlobAppended(r.value, BLOB_TTL_MIN) }] };
+        }
+
+        // action === 'seal'. sha256 format is validated here (index.ts's
+        // responsibility, before calling BlobStore) — an actual hash
+        // *mismatch* against the assembled body is BlobStore's job and
+        // comes back as a BlobFailure with the 14-2-confirmed wording,
+        // routed through blobFailureResult() below unchanged.
+        if (sha256 !== undefined && !/^[0-9a-f]{64}$/.test(sha256)) {
+          return { content: [{ type: 'text', text: 'Error: sha256 must be a 64-character lowercase hex string.' }], isError: true };
+        }
+        const r = blobs.seal(owner, blob_id, sha256);
+        if (!r.ok) return blobFailureResult(r);
+        return { content: [{ type: 'text', text: formatBlobAppended(r.value, BLOB_TTL_MIN) }] };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -4231,11 +4433,13 @@ async function startHttpTransport(): Promise<void> {
       //
       // Same reasoning applies to jobs (phase 13) — resolveJobOwner() uses
       // the identical session-id-vs-header split, so jobs.clear() is gated
-      // on the same CONVERSATION_OWNER_HEADER === '' check.
+      // on the same CONVERSATION_OWNER_HEADER === '' check. Same again for
+      // blobs (phase 14-2/14-3) via resolveBlobOwner().
       if (transport.sessionId) {
         if (CONVERSATION_OWNER_HEADER === '') {
           conversations.clear(transport.sessionId);
           jobs.clear(transport.sessionId);
+          blobs.clear(transport.sessionId);
         }
         sessions.delete(transport.sessionId);
       }
