@@ -48,10 +48,37 @@
 # HOUTINI_LM_JOB_CONCURRENCY       — max jobs actually running inference at once, across all owners (optional, default: 1)
 # HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN  — per-job soft timeout in minutes (optional, default: 15)
 # HOUTINI_LM_JOB_MAX_RESULT_CHARS  — max characters kept for a completed job's result (optional, default: 200000)
-#                             Like the conversation variables above, these seven are passed through
+# HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS — max characters of a completed job's result returned inline
+#                             by a single `jobs get` call before automatic chunking kicks in; larger
+#                             results are split into fixed-size chunks with a `Next` continuation
+#                             footer instead (optional, default: 50000). Set to 0 to disable automatic
+#                             chunking only — explicit offset/limit requests still work and still
+#                             chunk. Distinct from HOUTINI_LM_JOB_MAX_RESULT_CHARS above, which bounds
+#                             how much of a result is *retained* server-side at all; this one bounds
+#                             how much of that retained result comes back in a single unpaged response.
+#                             Also distinct from the blobs input-side chunk size below — see the
+#                             README's "Large payloads (blobs)" section for a table contrasting all
+#                             three limits.
+#                             Like the conversation variables above, these eight are passed through
 #                             below with an empty-string fallback (${VAR:-}) rather than a number
 #                             baked into this file — the one true default for each lives in
 #                             src/index.ts, so this file can never silently drift out of sync with it.
+# HOUTINI_LM_BLOBS                — enable/disable large-payload blob uploads (the blobs tool, plus
+#                             custom_prompt's context_blob_id), 1/0 (optional, default: 1). Doubles
+#                             as a production kill switch: set to 0 and redeploy to remove the blobs
+#                             tool and context_blob_id from the tool schema entirely.
+# HOUTINI_LM_BLOB_TTL_MIN          — blob idle-expiry window in minutes, from last create/append/seal/
+#                             read (optional, default: 30). Applies to both open and sealed blobs,
+#                             unlike conversations/jobs above which exempt in-flight state from TTL.
+# HOUTINI_LM_BLOB_MAX              — max blobs held at once, across all owners, open+sealed combined
+#                             (optional, default: 20)
+# HOUTINI_LM_BLOB_MAX_CHARS        — max characters a single blob's body may hold (optional, default: 2000000)
+# HOUTINI_LM_BLOB_MAX_TOTAL_CHARS  — max characters across all owners' blob bodies combined, open+sealed
+#                             (optional, default: 8000000)
+#                             Like the job variables above, these five are passed through below with
+#                             an empty-string fallback (${VAR:-}) rather than a number baked into this
+#                             file — the one true default for each lives in src/index.ts, so this file
+#                             can never silently drift out of sync with it.
 # MCP_AUTH_PROXY_HEADER_MAPPING — mcp-auth-proxy's `--header-mapping`/`HEADER_MAPPING` equivalent:
 #                             a JSON-pointer-to-header-name mapping (e.g. "/sub:X-Forwarded-User")
 #                             that forwards an OIDC claim as the request header
@@ -137,6 +164,12 @@ services:
       - HOUTINI_LM_JOB_CONCURRENCY=${HOUTINI_LM_JOB_CONCURRENCY:-}
       - HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN=${HOUTINI_LM_JOB_SOFT_TIMEOUT_MIN:-}
       - HOUTINI_LM_JOB_MAX_RESULT_CHARS=${HOUTINI_LM_JOB_MAX_RESULT_CHARS:-}
+      - HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS=${HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS:-}
+      - HOUTINI_LM_BLOBS=${HOUTINI_LM_BLOBS:-}
+      - HOUTINI_LM_BLOB_TTL_MIN=${HOUTINI_LM_BLOB_TTL_MIN:-}
+      - HOUTINI_LM_BLOB_MAX=${HOUTINI_LM_BLOB_MAX:-}
+      - HOUTINI_LM_BLOB_MAX_CHARS=${HOUTINI_LM_BLOB_MAX_CHARS:-}
+      - HOUTINI_LM_BLOB_MAX_TOTAL_CHARS=${HOUTINI_LM_BLOB_MAX_TOTAL_CHARS:-}
     volumes:
       - houtini-lm-state:/home/node/.houtini-lm
       - houtini-lm_shared:/mnt/houtini-lm-share:ro
@@ -150,12 +183,14 @@ services:
       start_period: 10s
     deploy:
       mode: replicated
-      # Server-side conversations AND async jobs both live in memory, per
-      # process, not shared across replicas — raising this above 1 would
-      # let a client's calls land on a different replica mid-conversation
-      # (silently losing its history) or land a jobs poll on a replica
-      # that never saw the job it's asking about. Keep this at 1 (or set
-      # HOUTINI_LM_CONVERSATIONS=0 and HOUTINI_LM_JOBS=0 first).
+      # Server-side conversations, async jobs, AND large-payload blobs all
+      # live in memory, per process, not shared across replicas — raising
+      # this above 1 would let a client's calls land on a different replica
+      # mid-conversation (silently losing its history), land a jobs poll on
+      # a replica that never saw the job it's asking about, or land a
+      # blobs append on a replica that never saw the blob's earlier chunks.
+      # Keep this at 1 (or set HOUTINI_LM_CONVERSATIONS=0,
+      # HOUTINI_LM_JOBS=0, and HOUTINI_LM_BLOBS=0 first).
       replicas: 1
       restart_policy:
         condition: any
