@@ -2691,6 +2691,39 @@ const ASYNC_WITH_CONVERSATION_MESSAGE =
   'limit for the initial release, not a technical incompatibility, and may be lifted later. Submit without the ' +
   'conversation params when using async: true, or drop async: true to use a conversation.';
 
+// Added to custom_prompt's inputSchema.properties when BLOBS_ENABLED (see
+// the conditional spread in TOOLS below) — mirrors ASYNC_PROPS's pattern.
+// Phase 14-3b: let a sealed blob (uploaded via the `blobs` tool) stand in
+// for `context`, so large inputs bypass the MCP transport's practical
+// payload ceiling. Deliberately NOT added to code_task_files' schema — that
+// tool already reads its own input from disk, so it has no analogous need
+// (phase 14-5, if ever).
+const BLOB_PROPS = {
+  context_blob_id: {
+    type: 'string',
+    description:
+      'Use a sealed blob (created with the blobs tool) as context instead of pasting it inline — for input too ' +
+      'large to send in one MCP call. The blob\'s full body is substituted for context verbatim; sending both ' +
+      'context and context_blob_id in the same call is an error. Not currently supported together with ' +
+      'start_conversation/conversation_id — this is a scope limit, not a technical incompatibility. Pairing with ' +
+      'async: true is the primary intended use (submit the job, then poll it — see the jobs tool), since a large ' +
+      'blob\'s prompt-processing time can exceed the ~180s synchronous call budget. Note: this only raises the ' +
+      'MCP transport\'s payload ceiling — it does NOT enlarge the model\'s own context window, so the assembled ' +
+      'prompt still has to fit that model\'s limit.',
+  },
+} as const;
+
+// Shared verbatim across custom_prompt's context_blob_id branch (see
+// ASYNC_WITH_CONVERSATION_MESSAGE for the same pattern) — one literal, so
+// the wording can never drift.
+const BLOB_WITH_CONTEXT_MESSAGE =
+  'Error: context and context_blob_id cannot both be set — context_blob_id supplies the context out-of-band, so ' +
+  'sending both is redundant. Use one or the other.';
+const BLOB_WITH_CONVERSATION_MESSAGE =
+  'Error: context_blob_id does not currently support start_conversation/conversation_id together — this is a ' +
+  'scope limit for the initial release, not a technical incompatibility, and may be lifted later. Submit without ' +
+  'the conversation params when using context_blob_id, or drop context_blob_id to use a conversation.';
+
 /** Shared "not found or not yours" response for the jobs tool — never distinguishes a nonexistent job_id from one owned by someone else, so a caller can't probe for other owners' jobs. */
 const JOB_NOT_FOUND_RESULT: CallToolResult = {
   content: [{ type: 'text', text: 'Error: this job was not found or is not available to you.' }],
@@ -2868,6 +2901,7 @@ const TOOLS: Tool[] = [
         },
         ...(CONVERSATIONS_ENABLED ? CONVERSATION_PROPS : {}),
         ...(JOBS_ENABLED ? ASYNC_PROPS : {}),
+        ...(BLOBS_ENABLED ? BLOB_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
       },
@@ -3304,7 +3338,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id, async: asyncFlag } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model, include_reasoning, force_thinking, start_conversation, conversation_id, async: asyncFlag, context_blob_id } = args as {
           system?: string;
           context?: string;
           instruction: string;
@@ -3317,7 +3351,54 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           start_conversation?: boolean;
           conversation_id?: string;
           async?: boolean;
+          context_blob_id?: string;
         };
+
+        // context_blob_id (phase 14-3b) — resolved to `effectiveContext`
+        // BEFORE the asyncFlag branch below, so both the async and sync
+        // paths (which each still reference plain `context` further down)
+        // read from the same resolved value. Three invariants:
+        //   1. Origin is exclusive: effectiveContext is EITHER "context_blob_id
+        //      unset -> context verbatim (undefined or '' included)" OR
+        //      "context_blob_id set -> the blob's body" — never a mix of
+        //      the two.
+        //   2. Blob-sourced values are never empty: an empty sealed blob is
+        //      rejected below (step vii) before effectiveContext is ever
+        //      assigned from it, so "blob body was ''" cannot silently
+        //      reach the truthy checks further down.
+        //   3. effectiveContext === '' can only happen via context: '' with
+        //      no context_blob_id — untouched by this phase, existing
+        //      truthy-check behaviour for `context` applies unchanged.
+        // blobs.read() is synchronous (no `await`), so inserting this block
+        // here does not disturb the active-limit check's race-free
+        // placement noted below (no new await is introduced before it).
+        // Because effectiveContext is computed once here and then baked
+        // into `messages` at submit time (for async: true, before
+        // submitJob()), a job that already started keeps its resolved blob
+        // text even if the blob is later deleted or its TTL expires.
+        let effectiveContext: string | undefined = context;
+        if (context_blob_id !== undefined) {
+          if (!BLOBS_ENABLED) {
+            return { content: [{ type: 'text', text: BLOBS_DISABLED_MESSAGE }], isError: true };
+          }
+          if (context !== undefined) {
+            return { content: [{ type: 'text', text: BLOB_WITH_CONTEXT_MESSAGE }], isError: true };
+          }
+          if (start_conversation !== undefined || conversation_id !== undefined) {
+            return { content: [{ type: 'text', text: BLOB_WITH_CONVERSATION_MESSAGE }], isError: true };
+          }
+          const ownerResult = resolveBlobOwner(extra);
+          if (ownerResult.kind === 'error') return ownerResult.result;
+          const r = blobs.read(ownerResult.owner, context_blob_id);
+          if (!r.ok) return blobFailureResult(r);
+          if (r.value === '') {
+            return {
+              content: [{ type: 'text', text: `Error: blob ${context_blob_id} is sealed but empty — nothing to use as context.` }],
+              isError: true,
+            };
+          }
+          effectiveContext = r.value;
+        }
 
         // async: true (phase 13) — submit as a background job instead of
         // running inline. Checked FIRST, before touching conversation state
@@ -3358,8 +3439,8 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
               structuredOutput: !!responseFormat,
             }),
           }];
-          if (context) {
-            messages.push({ role: 'user', content: `${CUSTOM_PROMPT_CONTEXT_PREFIX}${context}` });
+          if (effectiveContext) {
+            messages.push({ role: 'user', content: `${CUSTOM_PROMPT_CONTEXT_PREFIX}${effectiveContext}` });
             messages.push({ role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK });
           }
           messages.push({ role: 'user', content: instruction });
@@ -3441,7 +3522,7 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         // later falls out of history (ConversationStore.trim() evicts the
         // oldest turns first), this check goes false again and the pair is
         // transparently re-added — no action needed from the caller.
-        const contextTurn = context ? `${CUSTOM_PROMPT_CONTEXT_PREFIX}${context}` : undefined;
+        const contextTurn = effectiveContext ? `${CUSTOM_PROMPT_CONTEXT_PREFIX}${effectiveContext}` : undefined;
         const contextAlreadyInHistory =
           contextTurn !== undefined && history.some((t) => t.role === 'user' && t.content === contextTurn);
         if (contextTurn !== undefined && !contextAlreadyInHistory) {
