@@ -51,7 +51,16 @@ import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js'
 import { formatReasoningBlock } from './reasoning-block.js';
 import { resolveThinkingDecision, type ThinkingDecision } from './thinking-mode.js';
 import { ConversationStore, formatConversationLine, formatConversationList, type ConversationTurn } from './conversation-store.js';
-import { JobStore, formatJobSubmitted, formatJobStatus, formatJobList, type JobTool, type JobRecord } from './job-store.js';
+import {
+  JobStore,
+  formatJobSubmitted,
+  formatJobStatus,
+  formatJobList,
+  sliceResult,
+  formatJobChunkFooter,
+  type JobTool,
+  type JobRecord,
+} from './job-store.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -470,6 +479,35 @@ const JOB_SOFT_TIMEOUT_MIN = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_SOF
 // scripts/test-jobs-e2e.mjs's truncation case) need a much smaller ceiling
 // to exercise truncation without generating a 200K-char fake response.
 const JOB_MAX_RESULT_CHARS = Math.max(1, parseInt(process.env.HOUTINI_LM_JOB_MAX_RESULT_CHARS || '200000', 10) || 200_000);
+
+// jobs get's per-response inline size ceiling (phase 14-1) — distinct from
+// JOB_MAX_RESULT_CHARS above: that one bounds how much of a job's result is
+// *kept* server-side (excess silently truncated with a marker); this one
+// bounds how much of the *kept* result a single `jobs get` call returns
+// inline before switching to offset/limit-paged chunks (sliceResult /
+// formatJobChunkFooter in job-store.ts). Phase 14-0's D1 measurement found
+// N=100,000 chars succeeds end-to-end over the production MCP path but with
+// TTFT ~6x N=50,000's; 50,000 is the D1c-recommended default, giving ~2x
+// headroom under the largest N actually exercised.
+//
+// 0 is a meaningful value here (the D2 kill switch — disables auto-chunking,
+// restoring phase 13's always-return-everything-inline behavior), so this
+// can't use the `parseInt(...) || default` idiom the JOB_* vars above use:
+// that idiom can't distinguish "unset" from "explicitly 0" and would
+// silently reinterpret a typo'd value as the kill switch. Handled explicitly
+// instead: unset/blank -> default; a non-negative integer (0 included) ->
+// that value; anything else (negative, NaN, non-numeric) -> default, with a
+// stderr warning so a typo doesn't silently disable chunking.
+const JOB_RESULT_INLINE_MAX_CHARS_RAW = (process.env.HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS || '').trim();
+const JOB_RESULT_INLINE_MAX_CHARS = (() => {
+  if (JOB_RESULT_INLINE_MAX_CHARS_RAW === '') return 50_000;
+  const n = parseInt(JOB_RESULT_INLINE_MAX_CHARS_RAW, 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  process.stderr.write(
+    `[houtini-lm] Invalid HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS="${JOB_RESULT_INLINE_MAX_CHARS_RAW}" (must be a non-negative integer) — using default 50000\n`,
+  );
+  return 50_000;
+})();
 
 const jobs = new JobStore({
   ttlMs: JOB_TTL_MIN * 60_000,
@@ -2952,9 +2990,13 @@ const TOOLS: Tool[] = [
     description:
       'Check on or manage async jobs submitted via custom_prompt or code_task_files with async: true. Scoped to ' +
       'jobs you own — you can never see or touch another owner\'s jobs, and this tool never reveals whether one ' +
-      'exists. `list` returns metadata only (id, tool, state, age) — never result content. `get` returns a job\'s ' +
-      'current status, or its full result once completed — requires job_id. `delete` removes one job\'s record; ' +
-      'it does NOT cancel in-flight inference for a pending/running job — requires job_id.',
+      'exists. `list` returns metadata only (id, tool, state, age, result size in chars) — never result content. ' +
+      '`get` returns a job\'s current status, or its result once completed — requires job_id. A completed result ' +
+      'over the server\'s inline size ceiling is automatically split into chunks; the response ends with a footer ' +
+      'telling you the next `offset`/`limit` to request — copy that `Next` object verbatim into your following ' +
+      '`get` call rather than computing the next offset yourself (chunk boundaries can shift by a character to ' +
+      'avoid splitting a multi-byte character). `delete` removes one job\'s record; it does NOT cancel in-flight ' +
+      'inference for a pending/running job — requires job_id.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2976,6 +3018,20 @@ const TOOLS: Tool[] = [
             '"get" only: if the job has not finished yet, wait up to this many milliseconds (short-polling ' +
             'internally) before returning its current status, instead of returning immediately. 0 (default) ' +
             'returns immediately regardless of state. Max 30000 (30s) — values outside 0-30000 are clamped.',
+        },
+        offset: {
+          type: 'number',
+          description:
+            '"get" on a completed job only, ignored otherwise. 0-based character offset into the result to start ' +
+            'returning from. Omit for the beginning of the result. Do not compute this yourself when paging ' +
+            'through a chunked result — use the `offset` from the previous response\'s `Next` footer verbatim.',
+        },
+        limit: {
+          type: 'number',
+          description:
+            '"get" on a completed job only, ignored otherwise. Maximum characters to return starting at `offset`. ' +
+            'Omitting both `offset` and `limit` returns the full result inline if it is under the server\'s size ' +
+            'ceiling, or the first chunk (with a `Next` footer) if it is over.',
         },
       },
       required: ['action'],
@@ -3939,7 +3995,13 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
         }
 
-        const { action, job_id, wait_ms } = args as { action?: string; job_id?: string; wait_ms?: number };
+        const { action, job_id, wait_ms, offset, limit } = args as {
+          action?: string;
+          job_id?: string;
+          wait_ms?: number;
+          offset?: number;
+          limit?: number;
+        };
         if (action !== 'list' && action !== 'get' && action !== 'delete') {
           return {
             content: [{ type: 'text', text: 'Error: action must be one of "list", "get", "delete".' }],
@@ -3994,10 +4056,40 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         }
 
         if (record.state === 'completed') {
-          // Byte-identical to what a synchronous call would have returned
-          // (modulo JobStore's own maxResultChars truncation — see
-          // job-store.ts's truncateResult) — no status line prepended here.
-          return { content: [{ type: 'text', text: record.result ?? '' }] };
+          const full = record.result ?? '';
+          // `offset`/`limit` only ever apply to a completed job's `result` —
+          // a `failed` job's `error` (returned via formatJobStatus below)
+          // is never chunked; it's operator-facing diagnostic text, not the
+          // large model output this feature exists to page through.
+          const paged = offset !== undefined || limit !== undefined;
+          if (!paged && (JOB_RESULT_INLINE_MAX_CHARS === 0 || full.length <= JOB_RESULT_INLINE_MAX_CHARS)) {
+            // Byte-identical to what a synchronous call — or phase 13, before
+            // this feature existed — would have returned (modulo JobStore's
+            // own maxResultChars truncation; see job-store.ts's
+            // truncateResult). No status line, no footer.
+            return { content: [{ type: 'text', text: full }] };
+          }
+          // Either the caller explicitly asked for a window, or the result
+          // exceeds the inline ceiling and phase 14-1's auto-chunking kicks
+          // in. sliceResult clamps/adjusts offset and limit itself (see its
+          // doc comment) — pass them through unvalidated.
+          const slice = sliceResult(full, offset, limit, JOB_RESULT_INLINE_MAX_CHARS);
+          // touch() extends this job's lastUsedAt so a multi-call pagination
+          // sequence doesn't get swept by TTL or evicted by maxJobs pressure
+          // mid-sequence — see job-store.ts's header and JobStore.touch()
+          // doc comments. A plain (non-paged) get within the inline ceiling
+          // deliberately does NOT touch(): it's a status check, not a read
+          // of a large result, so it shouldn't extend the job's lifetime.
+          jobs.touch(owner, job_id);
+          // Next.limit echoes the caller's nominal request width (not
+          // necessarily slice.end - slice.start, which sliceResult's S5 can
+          // grow by one — see formatJobChunkFooter's doc comment) so a
+          // paging loop sees a consistent requested chunk size across calls.
+          // When the caller omitted `limit`, JOB_RESULT_INLINE_MAX_CHARS is
+          // what sliceResult actually used as the window (ceiling > 0 is the
+          // only way `paged` chunking continues past one call — see above).
+          const echoLimit = limit !== undefined && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : JOB_RESULT_INLINE_MAX_CHARS;
+          return { content: [{ type: 'text', text: slice.text + formatJobChunkFooter(job_id, slice, echoLimit) }] };
         }
         return { content: [{ type: 'text', text: formatJobStatus(record, Date.now()) }] };
       }
