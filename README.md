@@ -529,7 +529,7 @@ Poll with jobs get, job_id: "7f3a1c2e-...". Result kept for 60min after completi
 - `async` cannot be combined with `start_conversation` or `conversation_id` — a job and a conversation turn are two different lifecycles, and combining them is out of scope for now.
 - Each owner may have at most `HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER` jobs (`pending` or `running`) at once (default `2`); submitting past that limit is rejected outright rather than queued.
 
-**Turning it off** — set `HOUTINI_LM_JOBS=0` (also accepts `false`/`no`/`off`) and `async` disappears from `custom_prompt`'s and `code_task_files`'s schemas entirely, and the `jobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call. This is also the fastest way to fall back to fully synchronous behaviour without rolling back the image.
+**Turning it off** — set `HOUTINI_LM_JOBS=0` (also accepts `false`/`no`/`off`) and `async` disappears from `custom_prompt`'s and `code_task_files`'s schemas entirely, and the `jobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call. This is also the fastest way to fall back to fully synchronous behaviour without rolling back the image. Verified directly against `dist/index.js` over the stdio transport (fresh `tools/list` after restart with the variable set) — if a client still shows `async`/`jobs` after a redeploy with this flag flipped, suspect an MCP aggregator's own tool-catalog cache (e.g. a portal that fans out to several backend MCP servers) rather than houtini-lm itself; reconnecting that aggregator's own session, not just the underlying MCP connection, is usually what clears it.
 
 ## Large payloads (blobs)
 
@@ -579,7 +579,7 @@ create blobs chunks... -> seal -> custom_prompt({ context_blob_id: "3f9a1c2e-...
 - The per-blob and global caps (`HOUTINI_LM_BLOB_MAX_CHARS`, `HOUTINI_LM_BLOB_MAX_TOTAL_CHARS`, `HOUTINI_LM_BLOB_MAX`) are shared across every owner with no per-owner quota — a single busy caller can in principle fill the global budget and cause other callers' `blobs create`/`append` to fail with a capacity error until idle blobs expire or are deleted. Mitigated only by the idle TTL and explicit `delete`, not by any per-owner fairness mechanism.
 - The empirical safe ceiling for a *single* MCP request's body size (as opposed to the recommended 50,000-character chunk size above) has not been fully measured — 50,000 characters is a conservative, tested-safe recommendation, not a hard protocol limit.
 
-**Turning it off** — set `HOUTINI_LM_BLOBS=0` (also accepts `false`/`no`/`off`) and `context_blob_id` disappears from `custom_prompt`'s schema entirely, and the `blobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call.
+**Turning it off** — set `HOUTINI_LM_BLOBS=0` (also accepts `false`/`no`/`off`) and `context_blob_id` disappears from `custom_prompt`'s schema entirely, and the `blobs` tool itself stops appearing in `tools/list` — rather than being present and erroring on every call. Verified directly against `dist/index.js` over the stdio transport (fresh `tools/list` after restart with the variable set) — if a client still shows `blobs`/`context_blob_id` after a redeploy with this flag flipped, suspect an MCP aggregator's own tool-catalog cache (e.g. a portal that fans out to several backend MCP servers) rather than houtini-lm itself; reconnecting that aggregator's own session, not just the underlying MCP connection, is usually what clears it.
 
 ## Structured JSON output
 

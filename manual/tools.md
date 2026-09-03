@@ -99,7 +99,7 @@ Three actions, chosen with the `action` parameter: `list` returns a table of you
 
 `get` also accepts `offset`/`limit` to page through a large result instead of getting it all at once. A `completed` result past `HOUTINI_LM_JOB_RESULT_INLINE_MAX_CHARS` (default 50,000 chars) is automatically chunked this way even without asking - the response carries a `Next` footer telling you exactly what to pass on the following call. Copy it verbatim rather than computing the next offset yourself. A `failed` job's `error` is always returned whole, never chunked.
 
-Not in the tool list at all if the server's running with `HOUTINI_LM_JOBS=0`.
+Not in the tool list at all if the server's running with `HOUTINI_LM_JOBS=0` (verified against `dist/index.js` directly over stdio; if a client still shows it after such a redeploy, suspect that client's own tool-catalog cache before suspecting the server - see [Troubleshooting](troubleshooting.md)).
 
 ## blobs
 
@@ -109,7 +109,7 @@ Five actions, chosen with the `action` parameter: `create` starts a new blob, op
 
 50,000 characters per chunk is the recommended `append` size - measured safe over the production MCP path. A sealed blob's id becomes `custom_prompt`'s `context_blob_id`.
 
-Not in the tool list at all if the server's running with `HOUTINI_LM_BLOBS=0`.
+Not in the tool list at all if the server's running with `HOUTINI_LM_BLOBS=0` (verified against `dist/index.js` directly over stdio; if a client still shows it after such a redeploy, suspect that client's own tool-catalog cache before suspecting the server - see [Troubleshooting](troubleshooting.md)).
 
 ## Reading the footer
 
