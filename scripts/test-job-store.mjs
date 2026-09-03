@@ -554,5 +554,55 @@ let charsSummaries;
   ok('formatJobList: header includes the chars column', listOutput.includes('chars'));
 }
 
+// --- phase 15-1a: conversationId is stored and surfaced on JobRecord, not JobSummary ---
+{
+  const store = new JobStore(DEFAULT_OPTS);
+  const owner = 'session-conv-a';
+  const id = store.create(owner, 'custom_prompt', 'conv-123');
+  eq('create() with conversationId: get() surfaces it on JobRecord', store.get(owner, id).conversationId, 'conv-123');
+  ok('list() summaries have no conversationId field', !('conversationId' in store.list(owner)[0]));
+  const noConvId = store.create(owner, 'custom_prompt');
+  eq('create() without conversationId: get() reports undefined', store.get(owner, noConvId).conversationId, undefined);
+}
+
+// --- phase 15-1a: activeJobIdsForConversation() — pending/running only, owner+conversation scoped ---
+{
+  const store = new JobStore(DEFAULT_OPTS);
+  const owner = 'session-conv-b';
+  const otherOwner = 'session-conv-b-other';
+
+  eq('no jobs at all: empty array', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+
+  const pendingId = store.create(owner, 'custom_prompt', 'conv-x');
+  eq('one pending job in the conversation: found', store.activeJobIdsForConversation(owner, 'conv-x'), [pendingId]);
+
+  store.markRunning(pendingId);
+  eq('same job now running: still found', store.activeJobIdsForConversation(owner, 'conv-x'), [pendingId]);
+
+  store.markCompleted(pendingId, 'done');
+  eq('job now completed: no longer active', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+
+  const failedId = store.create(owner, 'custom_prompt', 'conv-x');
+  store.markRunning(failedId);
+  store.markFailed(failedId, 'boom');
+  eq('job now failed: no longer active', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+
+  const noConvId = store.create(owner, 'custom_prompt');
+  eq('a job with no conversationId is never returned', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+  eq('...nor when queried without a conversationId match at all', store.activeJobIdsForConversation(owner, 'undefined'), []);
+
+  const otherConvId = store.create(owner, 'custom_prompt', 'conv-y');
+  eq('a job bound to a different conversationId is not returned', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+  eq('...but is returned for its own conversationId', store.activeJobIdsForConversation(owner, 'conv-y'), [otherConvId]);
+
+  store.create(otherOwner, 'custom_prompt', 'conv-x');
+  eq('a same-conversationId job under a different owner is not returned', store.activeJobIdsForConversation(owner, 'conv-x'), []);
+
+  const idA = store.create(owner, 'custom_prompt', 'conv-multi');
+  const idB = store.create(owner, 'code_task_files', 'conv-multi');
+  const found = store.activeJobIdsForConversation(owner, 'conv-multi').sort();
+  eq('multiple active jobs on the same conversation are all returned', found, [idA, idB].sort());
+}
+
 process.stdout.write(failed ? `\n${failed} FAILED\n` : '\nAll job-store tests passed\n');
 process.exitCode = failed ? 1 : 0;

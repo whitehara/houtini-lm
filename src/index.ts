@@ -548,21 +548,33 @@ const JOB_PREFILL_TIMEOUT_MS = JOB_SOFT_TIMEOUT_MS;
 const JOB_LOCK_MAX_WAIT_MS = JOB_SOFT_TIMEOUT_MS;
 
 // Job execution functions, keyed by job id. JobStore (job-store.ts) tracks
-// only state + result/error — the actual () => Promise<string> to run is a
-// runner-only concern that lives here. Removed as soon as pump() claims a
-// job (see below), so a fn can never leak or run twice.
-const jobFns = new Map<string, () => Promise<string>>();
+// only state + result/error — the actual (jobId) => Promise<string> to run
+// is a runner-only concern that lives here. Removed as soon as pump() claims
+// a job (see below), so a fn can never leak or run twice.
+//
+// Phase 15-1a: fn now takes its own jobId. This lets fn re-check, right
+// before it appends conversation turns on completion, that its own job
+// record still exists (jobs.get(owner, jobId) !== undefined) — `jobs
+// delete`/`jobs clear` remove the record but do NOT stop the in-flight fn()
+// call (see job-store.ts's delete() doc comment), so without this check a
+// deleted job's completion would still append its turns, potentially behind
+// turns a later call already recorded ("ghost append", found by
+// plan-deep-check's Fable review). fn bodies that don't touch conversations
+// simply ignore the argument.
+const jobFns = new Map<string, (jobId: string) => Promise<string>>();
 let jobsRunning = 0;
 
 /**
  * Create a job record and register its execution function, then kick the
  * queue. Returns the new job id immediately — actual execution happens
- * later, drained by pump()/runJob() below.
+ * later, drained by pump()/runJob() below. `conversationId` (phase 15-1a),
+ * if given, is recorded on the job so `activeJobIdsForConversation` (D3)
+ * can find it while it's pending/running.
  */
-function submitJob(owner: string, tool: JobTool, fn: () => Promise<string>): string {
-  const id = jobs.create(owner, tool);
+function submitJob(owner: string, tool: JobTool, fn: (jobId: string) => Promise<string>, conversationId?: string): string {
+  const id = jobs.create(owner, tool, conversationId);
   jobFns.set(id, fn);
-  process.stderr.write(`[houtini-lm] job ${id} (${tool}) submitted\n`);
+  process.stderr.write(`[houtini-lm] job ${id} (${tool}${conversationId ? `, conversation ${conversationId}` : ''}) submitted\n`);
   pump();
   return id;
 }
@@ -609,10 +621,10 @@ function pump(): void {
  * inside the first acquisition. Found via plan-deep-check's Fable review
  * before any of this shipped — see phase13-async-jobs.md.
  */
-async function runJob(record: JobRecord, fn: () => Promise<string>): Promise<void> {
+async function runJob(record: JobRecord, fn: (jobId: string) => Promise<string>): Promise<void> {
   const startedAt = Date.now();
   try {
-    const result = await fn();
+    const result = await fn(record.id);
     jobs.markCompleted(record.id, result);
     process.stderr.write(`[houtini-lm] job ${record.id} completed in ${Date.now() - startedAt}ms (${result.length} chars)\n`);
   } catch (err) {
@@ -2404,10 +2416,17 @@ const REASONING_PROPS = {
 // out entirely" and "the caller passed start_conversation: false with no
 // conversation_id" — in both cases there is no active conversation and the
 // caller proceeds exactly as it would with the params omitted.
+// `historyLength` (phase 15-1a) is `history.length` as resolved here — the
+// only place callers re-check it against, right before submitJob(), to
+// detect a same-conversation append that landed during the await window
+// between this resolution and submission (see that call site's comment).
+// Not derived from `history.length` again there on purpose: this field is
+// the frozen snapshot value, `history` itself is not re-read for the
+// comparison.
 type ConversationContext =
   | { kind: 'none' }
   | { kind: 'error'; result: CallToolResult }
-  | { kind: 'active'; owner: string; id: string; history: ConversationTurn[]; startIgnoredNote: string };
+  | { kind: 'active'; owner: string; id: string; history: ConversationTurn[]; historyLength: number; startIgnoredNote: string };
 
 // Shared verbatim between resolveConversation() below and every other call
 // site that needs to know whether server-side conversations are turned on
@@ -2604,7 +2623,33 @@ function resolveConversation(
     return { kind: 'none' };
   }
 
-  return { kind: 'active', owner: conversationOwner, id: activeConversationId, history, startIgnoredNote };
+  // Phase 15-1a, D3: reject if this conversation already has a pending/
+  // running job. Placed here — the single point every caller (chat,
+  // custom_prompt sync and async, code_task_files sync and async) folds its
+  // conversation args through — rather than duplicated at each call site,
+  // so a future tool can't forget it. A freshly created conversation
+  // (the `start_conversation: true` branch above) can never hit this: its
+  // id is a brand-new UUID, and no job can already reference an id that
+  // didn't exist a moment ago. Async submitters re-run this same check
+  // immediately before submitJob() (see those call sites) to close the
+  // await window between this resolution and actual submission — this
+  // first check alone only covers synchronous callers and a submission's
+  // opening look.
+  if (JOBS_ENABLED) {
+    const busyJobIds = jobs.activeJobIdsForConversation(conversationOwner, activeConversationId);
+    if (busyJobIds.length > 0) {
+      return { kind: 'error', result: conversationBusyError(activeConversationId, busyJobIds) };
+    }
+  }
+
+  return {
+    kind: 'active',
+    owner: conversationOwner,
+    id: activeConversationId,
+    history,
+    historyLength: history.length,
+    startIgnoredNote,
+  };
 }
 
 /**
@@ -2615,15 +2660,68 @@ function resolveConversation(
  *
  * Only the turns passed in are retained — never the reasoning block,
  * footer, or this conversation line itself.
+ *
+ * Phase 15-1a, D5: a job can run long enough for its conversation to expire
+ * (TTL) or be deleted mid-flight — ConversationStore.append() is a silent
+ * no-op against a missing conversation (see that method's doc comment), so
+ * without this check the turns would simply vanish with no indication to
+ * the caller. Checked here (not just in the async job path) so the same
+ * protection covers a slow synchronous call racing a `conversations delete`
+ * too.
  */
 function recordConversationTurns(conv: ConversationContext, turns: ConversationTurn[], extraNote?: string): string {
   if (conv.kind !== 'active') {
     return '';
   }
+  if (conversations.get(conv.owner, conv.id) === undefined) {
+    return '\nconversation expired; turns were not recorded';
+  }
   conversations.append(conv.owner, conv.id, turns);
   const updated = conversations.get(conv.owner, conv.id) ?? [];
   const chars = updated.reduce((sum, t) => sum + t.content.length, 0);
   return `\n${formatConversationLine(conv.id, updated.length, chars, CONVERSATION_TTL_MIN)}${conv.startIgnoredNote}${extraNote ?? ''}`;
+}
+
+/**
+ * custom_prompt's context/ack dedup decision (phase 15-1a extraction —
+ * previously inlined only in the synchronous path; now shared with the
+ * async: true branch, which can build the same kind of history-aware
+ * messages now that it goes through resolveConversation() too). `history`
+ * absent (`undefined`, the async branch's no-conversation case) behaves
+ * identically to an empty array — `.some()` over either is `false` — so a
+ * non-active call always gets `contextAlreadyInHistory: false`, matching
+ * the exact previous behaviour of both paths byte-for-byte.
+ *
+ * `contextToSend` is what to actually push into `messages` (the context/ack
+ * pair) — `undefined` when there's nothing to send (no context given) or
+ * it's already in history. Whitespace differences are NOT normalised — this
+ * is a byte-for-byte match against CUSTOM_PROMPT_CONTEXT_PREFIX + context,
+ * exactly like the code this replaces.
+ */
+function customPromptContextState(
+  history: readonly ConversationTurn[] | undefined,
+  effectiveContext: string | undefined,
+): { contextToSend: string | undefined; contextAlreadyInHistory: boolean } {
+  const contextTurn = effectiveContext ? `${CUSTOM_PROMPT_CONTEXT_PREFIX}${effectiveContext}` : undefined;
+  const contextAlreadyInHistory =
+    contextTurn !== undefined && (history ?? []).some((t) => t.role === 'user' && t.content === contextTurn);
+  return { contextToSend: contextAlreadyInHistory ? undefined : contextTurn, contextAlreadyInHistory };
+}
+
+/**
+ * The trailing user/assistant pair to store for one custom_prompt turn
+ * (phase 15-1a extraction). Deliberately just this pair, not the optional
+ * leading context/ack pair — callers that need to store a newly-sent
+ * context turn too (see customPromptContextState's `contextToSend`) prepend
+ * `{ role: 'user', content: contextToSend }, { role: 'assistant', content:
+ * CUSTOM_PROMPT_CONTEXT_ACK }` themselves, mirroring how `messages` itself
+ * is assembled at each call site. Pure — no I/O, no conversations.* calls.
+ */
+function customPromptTurnsToStore(userText: string, assistantText: string): ConversationTurn[] {
+  return [
+    { role: 'user', content: userText },
+    { role: 'assistant', content: assistantText },
+  ];
 }
 
 // Added to chat's and custom_prompt's inputSchema.properties when
@@ -2652,7 +2750,9 @@ const CONVERSATION_PROPS = {
       'automatically. If both start_conversation and conversation_id are given, conversation_id wins and ' +
       "start_conversation is ignored. For custom_prompt, context is recorded in this history only the first " +
       'time it is sent for a given conversation — resending the identical context on a later call does not ' +
-      'duplicate it.',
+      'duplicate it. While a job is pending/running for this conversation (submitted with async: true), any new ' +
+      'call against it — async or synchronous — is rejected until that job completes; poll it with the jobs tool ' +
+      'instead of submitting another.',
   },
 } as const;
 
@@ -2675,10 +2775,12 @@ const ASYNC_PROPS = {
       'Submit this call as a background job instead of waiting for the result inline. Returns a job id ' +
       'immediately — poll it with the jobs tool (action: "get", job_id: "..."). Submission itself still takes ' +
       'roughly a second (it resolves model routing first) — "immediately" means no wait for inference, not zero ' +
-      'latency. Not currently supported together with start_conversation/conversation_id — this is a scope limit ' +
-      'for the initial release, not a technical incompatibility, and may be lifted later; submit without those ' +
-      'params when using async: true. Each caller may have only a few jobs pending/running at once ' +
-      '(HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER on the server) — finish or check on one before submitting another.',
+      'latency. Can be combined with start_conversation/conversation_id — the conversation is updated once the ' +
+      'job completes, and its provisional turn count is 0 until then. While a job is pending/running for a given ' +
+      'conversation, any new call against that conversation (async or synchronous, on this tool or another) is ' +
+      'rejected until it completes — wait for it or check on it with the jobs tool before submitting another. ' +
+      'Each caller may have only a few jobs pending/running at once (HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER on the ' +
+      'server) — finish or check on one before submitting another.',
   },
 } as const;
 
@@ -2740,6 +2842,30 @@ function jobActiveLimitError(owner: string): CallToolResult | undefined {
         `Error: you already have ${JOB_ACTIVE_MAX_PER_OWNER} active job(s) (pending + running) — the limit for ` +
         `this server (HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER). Wait for one to finish, or check on it with the jobs ` +
         `tool, before submitting another.`,
+    }],
+    isError: true,
+  };
+}
+
+/**
+ * Phase 15-1a, D3 (same-conversation execution exclusion): the error
+ * returned when `conversationId` has a pending/running job. Used both by
+ * resolveConversation()'s early check (covers chat/custom_prompt's/
+ * code_task_files' synchronous paths, plus a submission's first look) and
+ * by each async: true branch's re-check immediately before submitJob()
+ * (covers the await window between resolveConversation() and submission —
+ * see that call site's comment for why the re-check exists). `jobIds` are
+ * echoed back so the caller can go straight to `jobs get` rather than
+ * guessing which job is blocking it.
+ */
+function conversationBusyError(conversationId: string, jobIds: string[]): CallToolResult {
+  return {
+    content: [{
+      type: 'text',
+      text:
+        `Error: conversation ${conversationId} has a job still in progress (${jobIds.join(', ')}). Wait for it to ` +
+        `finish — poll with the jobs tool (action: "get", job_id: "${jobIds[0]}") — before using this conversation ` +
+        `again.`,
     }],
     isError: true,
   };
@@ -3400,19 +3526,25 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           effectiveContext = r.value;
         }
 
-        // async: true (phase 13) — submit as a background job instead of
-        // running inline. Checked FIRST, before touching conversation state
-        // at all, so a non-async call's behaviour below is completely
-        // unaffected by this branch existing. See ASYNC_PROPS's schema text
-        // for why start_conversation/conversation_id are rejected here
-        // rather than silently ignored.
+        // async: true (phase 13; phase 15-1a lifts the earlier
+        // conversation-params rejection) — submit as a background job
+        // instead of running inline. Checked FIRST, before touching
+        // conversation state at all, so a non-async call's behaviour below
+        // is completely unaffected by this branch existing.
         if (asyncFlag === true) {
           if (!JOBS_ENABLED) {
             return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
           }
-          if (start_conversation !== undefined || conversation_id !== undefined) {
-            return { content: [{ type: 'text', text: ASYNC_WITH_CONVERSATION_MESSAGE }], isError: true };
-          }
+          // resolveConversation() itself is synchronous (no `await`), so
+          // calling it here does not disturb the active-limit/D3-recheck's
+          // race-free placement further below. Covers: conversations
+          // disabled, an unresolvable owner, a conversation_id that doesn't
+          // exist, and D3 (a busy conversation) — all via conv.kind ===
+          // 'error'.
+          const conv = resolveConversation(start_conversation, conversation_id, extra);
+          if (conv.kind === 'error') return conv.result;
+          const history: ConversationTurn[] = conv.kind === 'active' ? conv.history : [];
+
           // Owner resolution has no `await` in it (see resolveOwnerKey()),
           // so this is safe to do early — it's the active-limit CHECK that
           // must be deferred (see below).
@@ -3426,10 +3558,9 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           const route = await routeToModel('analysis', model);
           const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
 
-          // No conversation history is possible here (rejected above), so
-          // this is exactly the sync path's "no history" branch: system
-          // prompt, optional context/ack pair, instruction. No dedup check
-          // is needed either — there is no history to dedup against.
+          // Same assembly order as the synchronous path below (system ->
+          // history -> context/ack pair -> instruction), so the two paths
+          // produce byte-identical messages for the same conversation state.
           const messages: ChatMessage[] = [{
             role: 'system',
             content: buildSystemPrompt({
@@ -3439,8 +3570,10 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
               structuredOutput: !!responseFormat,
             }),
           }];
-          if (effectiveContext) {
-            messages.push({ role: 'user', content: `${CUSTOM_PROMPT_CONTEXT_PREFIX}${effectiveContext}` });
+          messages.push(...history);
+          const { contextToSend, contextAlreadyInHistory } = customPromptContextState(history, effectiveContext);
+          if (contextToSend !== undefined) {
+            messages.push({ role: 'user', content: contextToSend });
             messages.push({ role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK });
           }
           messages.push({ role: 'user', content: instruction });
@@ -3450,22 +3583,39 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
 
           // Checked here — AFTER the routeToModel()/estimatePrefill() awaits
           // above, immediately before submitJob() — rather than earlier
-          // alongside the JOBS_ENABLED/conversation-param checks. Those two
-          // awaits yield the event loop, so checking the active-job count
-          // before them would leave a window where two concurrent async
-          // calls from the same owner could both read the same
-          // under-the-limit count and both proceed, bypassing
-          // HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER. No further await happens
-          // between this check and submitJob() below (fn is only defined
-          // here, not invoked), so this placement is race-free. Matches
-          // code_task_files' async branch, which places the same check
-          // immediately before its own submitJob() call for the same reason.
+          // alongside the JOBS_ENABLED check. Those two awaits yield the
+          // event loop, so checking the active-job count (and, phase
+          // 15-1a, D3 + the conversation snapshot) before them would leave
+          // a window where a concurrent call could slip through. No further
+          // await happens between these checks and submitJob() below (fn
+          // is only defined here, not invoked), so this placement is
+          // race-free. Matches code_task_files' async branch, which places
+          // the same checks immediately before its own submitJob() call for
+          // the same reason.
+          if (conv.kind === 'active') {
+            const busyJobIds = jobs.activeJobIdsForConversation(conv.owner, conv.id);
+            if (busyJobIds.length > 0) {
+              return conversationBusyError(conv.id, busyJobIds);
+            }
+            const currentHistory = conversations.get(conv.owner, conv.id);
+            if (currentHistory === undefined || currentHistory.length !== conv.historyLength) {
+              return {
+                content: [{
+                  type: 'text',
+                  text:
+                    `Error: conversation ${conv.id} changed since this call started (its turn count no longer ` +
+                    `matches what was read). Retry the call to pick up the latest history before submitting.`,
+                }],
+                isError: true,
+              };
+            }
+          }
           const limitError = jobActiveLimitError(owner);
           if (limitError) return limitError;
 
           const sampling = extractSamplingParams(args as Record<string, unknown>);
-          const fn = async (): Promise<string> => {
-            const { text } = await runInference(messages, {
+          const fn = async (jobId: string): Promise<string> => {
+            const { text, resp } = await runInference(messages, {
               temperature: validTemperature(temperature) ?? route.hints.chatTemp,
               maxTokens: validMaxTokens(max_tokens),
               model: route.modelId,
@@ -3480,13 +3630,42 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
               // outlives the request that submitted it, whose response (and
               // SSE stream, over HTTP) is already closed by the time this runs.
             });
-            return text;
+            if (conv.kind !== 'active') {
+              return text;
+            }
+            // Ghost-append guard (phase 15-1a, found by plan-deep-check's
+            // Fable review): `jobs delete`/`jobs clear` remove this job's
+            // record but do NOT stop this in-flight fn() call (see
+            // job-store.ts delete()'s doc comment) — without this check, a
+            // deleted job's completion would still append its turns,
+            // possibly behind turns a later call already recorded. `extra`
+            // is never referenced here — only `conv`'s owner/id, captured
+            // at submission time — so a deleted-then-recreated session
+            // can't redirect this append to the wrong owner.
+            if (jobs.get(owner, jobId) === undefined) {
+              return `${text}\nconversation not updated; the job record was deleted before completion`;
+            }
+            const turnsToStore: ConversationTurn[] =
+              contextToSend !== undefined
+                ? [
+                    { role: 'user', content: contextToSend },
+                    { role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK },
+                    ...customPromptTurnsToStore(instruction, resp.content),
+                  ]
+                : customPromptTurnsToStore(instruction, resp.content);
+            const contextNote = contextAlreadyInHistory
+              ? ' context was already recorded for this conversation and was not resent to the model.'
+              : undefined;
+            const conversationLine = recordConversationTurns(conv, turnsToStore, contextNote);
+            return text + conversationLine;
           };
 
-          const jobId = submitJob(owner, 'custom_prompt', fn);
-          return {
-            content: [{ type: 'text', text: formatJobSubmitted(jobId, 'custom_prompt', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN) }],
-          };
+          const jobId = submitJob(owner, 'custom_prompt', fn, conv.kind === 'active' ? conv.id : undefined);
+          let submittedText = formatJobSubmitted(jobId, 'custom_prompt', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN);
+          if (conv.kind === 'active' && conversation_id === undefined && start_conversation === true) {
+            submittedText += `\nStarted conversation ${conv.id} (0 turns so far — turns are recorded once this job completes).`;
+          }
+          return { content: [{ type: 'text', text: submittedText }] };
         }
 
         const conv = resolveConversation(start_conversation, conversation_id, extra);
@@ -3522,11 +3701,9 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         // later falls out of history (ConversationStore.trim() evicts the
         // oldest turns first), this check goes false again and the pair is
         // transparently re-added — no action needed from the caller.
-        const contextTurn = effectiveContext ? `${CUSTOM_PROMPT_CONTEXT_PREFIX}${effectiveContext}` : undefined;
-        const contextAlreadyInHistory =
-          contextTurn !== undefined && history.some((t) => t.role === 'user' && t.content === contextTurn);
-        if (contextTurn !== undefined && !contextAlreadyInHistory) {
-          messages.push({ role: 'user', content: contextTurn });
+        const { contextToSend, contextAlreadyInHistory } = customPromptContextState(history, effectiveContext);
+        if (contextToSend !== undefined) {
+          messages.push({ role: 'user', content: contextToSend });
           messages.push({ role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK });
         }
         messages.push({ role: 'user', content: instruction });
@@ -3548,17 +3725,13 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         // conversation's history never accumulates duplicate copies of the
         // same context. The instruction/response pair is always stored.
         const turnsToStore: ConversationTurn[] =
-          contextTurn !== undefined && !contextAlreadyInHistory
+          contextToSend !== undefined
             ? [
-                { role: 'user', content: contextTurn },
+                { role: 'user', content: contextToSend },
                 { role: 'assistant', content: CUSTOM_PROMPT_CONTEXT_ACK },
-                { role: 'user', content: instruction },
-                { role: 'assistant', content: resp.content },
+                ...customPromptTurnsToStore(instruction, resp.content),
               ]
-            : [
-                { role: 'user', content: instruction },
-                { role: 'assistant', content: resp.content },
-              ];
+            : customPromptTurnsToStore(instruction, resp.content);
         const contextNote = contextAlreadyInHistory
           ? ' context was already recorded for this conversation and was not resent to the model.'
           : undefined;

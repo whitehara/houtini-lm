@@ -106,6 +106,8 @@ interface JobEntry {
   lastUsedAt: number;
   result?: string;
   error?: string;
+  /** conversation_id this job is appending to on completion (phase 15-1a), if any. Not surfaced on JobSummary/formatJobList — jobs list's table columns are an existing contract, not extended here. */
+  conversationId?: string;
 }
 
 /** Full job detail, as returned by get(). No `owner` field — the caller already knows its own owner. */
@@ -117,6 +119,7 @@ export interface JobRecord {
   lastUsedAt: number;
   result?: string;
   error?: string;
+  conversationId?: string;
 }
 
 /** Lightweight job overview, as returned by list() — omits result/error bodies so listing many jobs stays cheap. */
@@ -149,6 +152,7 @@ function toRecord(entry: JobEntry): JobRecord {
     lastUsedAt: entry.lastUsedAt,
     result: entry.result,
     error: entry.error,
+    conversationId: entry.conversationId,
   };
 }
 
@@ -367,8 +371,8 @@ export class JobStore {
     return oldestId;
   }
 
-  /** Create a new job in `pending` state. Returns its id. */
-  create(owner: string, tool: JobTool): string {
+  /** Create a new job in `pending` state. Returns its id. `conversationId` (phase 15-1a), if given, is the conversation this job will append to on completion — see `activeJobIdsForConversation` below for what it's used for. */
+  create(owner: string, tool: JobTool, conversationId?: string): string {
     const now = this.options.now();
     this.sweep(now);
     if (this.entries.size >= this.options.maxJobs) {
@@ -380,7 +384,7 @@ export class JobStore {
       if (evictId !== undefined) this.entries.delete(evictId);
     }
     const id = randomUUID();
-    this.entries.set(id, { owner, id, tool, state: 'pending', createdAt: now, lastUsedAt: now });
+    this.entries.set(id, { owner, id, tool, state: 'pending', createdAt: now, lastUsedAt: now, conversationId });
     return id;
   }
 
@@ -455,6 +459,31 @@ export class JobStore {
       if (entry.owner === owner && (entry.state === 'pending' || entry.state === 'running')) n++;
     }
     return n;
+  }
+
+  /**
+   * Ids of `owner`'s pending+running jobs bound to `conversationId` (phase
+   * 15-1a, D3: same-conversation execution exclusion). Only pending/running
+   * jobs are considered — a completed/failed job has already appended (or
+   * given up appending) its turns, so it no longer contends for the
+   * conversation. Not owner+conversation-keyed in the map itself (jobs are
+   * keyed by id alone, see the module header) — this is a linear scan over
+   * all entries, acceptable at the expected job-store scale (same tradeoff
+   * `countActive`/`clear` already make). No sweep — pending/running jobs
+   * are never TTL-eligible anyway.
+   */
+  activeJobIdsForConversation(owner: string, conversationId: string): string[] {
+    const ids: string[] = [];
+    for (const entry of this.entries.values()) {
+      if (
+        entry.owner === owner &&
+        entry.conversationId === conversationId &&
+        (entry.state === 'pending' || entry.state === 'running')
+      ) {
+        ids.push(entry.id);
+      }
+    }
+    return ids;
   }
 
   /**

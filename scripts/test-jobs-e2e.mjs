@@ -26,6 +26,9 @@ function ok(name, cond, detail) {
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// Global variant for String.matchAll() (phase 15-1a: extracting the 2nd UUID — the conversation id — out of a
+// "Job <uuid> submitted ... Started conversation <uuid>" response). matchAll() throws on a non-global RegExp.
+const UUID_RE_G = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 async function callTool(baseUrl, sessionId, toolName, args, id) {
   const res = await post(baseUrl, '/mcp', {
@@ -38,6 +41,10 @@ async function callTool(baseUrl, sessionId, toolName, args, id) {
 const callCustomPrompt = (baseUrl, sessionId, args, id) => callTool(baseUrl, sessionId, 'custom_prompt', args, id);
 const callCodeTaskFiles = (baseUrl, sessionId, args, id) => callTool(baseUrl, sessionId, 'code_task_files', args, id);
 const callJobs = (baseUrl, sessionId, args, id) => callTool(baseUrl, sessionId, 'jobs', args, id);
+// phase 15-1a: chat/conversations helpers, mirroring test-conversations-e2e.mjs's, needed to exercise D3's
+// cross-tool exclusion and D5's mid-flight-delete case.
+const callChat = (baseUrl, sessionId, args, id) => callTool(baseUrl, sessionId, 'chat', args, id);
+const callConversations = (baseUrl, sessionId, args, id) => callTool(baseUrl, sessionId, 'conversations', args, id);
 
 async function toolsList(baseUrl, sessionId, id) {
   const res = await post(baseUrl, '/mcp', { jsonrpc: '2.0', id, method: 'tools/list', params: {} }, sessionId);
@@ -46,6 +53,16 @@ async function toolsList(baseUrl, sessionId, id) {
 
 function textOf(result) {
   return result?.content?.[0]?.text ?? '';
+}
+
+/**
+ * True if `conversations list`'s markdown table (`| conversation_id | turns | chars | idle | expires in |`)
+ * shows exactly `n` turns for `convId`. NOT the "💬 Conversation ... — N turns" trailing line format
+ * (formatConversationLine in src/conversation-store.ts) — that one is appended to chat/custom_prompt
+ * responses, not to `list`'s table rows.
+ */
+function convHasTurns(listText, convId, n) {
+  return new RegExp(`\\|\\s*${convId}\\s*\\|\\s*${n}\\s*\\|`).test(listText);
 }
 
 /** Content portion of a synchronous/completed-job response, stripped of the timing-dependent "---" footer. */
@@ -218,20 +235,188 @@ async function main() {
       ok('get after delete: isError (not found)', getAfterDelete?.isError === true, JSON.stringify(getAfterDelete));
     }
 
-    // --- async: true together with start_conversation or conversation_id is rejected, with the "not currently supported" framing ---
+    // --- phase 15-1a: async: true together with start_conversation/conversation_id is now ALLOWED. This is an
+    // intentional contract reversal from the block this replaces ("async + conversation is rejected") — see
+    // .claude/phases/phase15-async-conversations.md and the commit message for the rationale (D1-D6). ---
+
+    // --- D1/D2: async + start_conversation submits, completes, and the conversation reaches 2 turns ---
+    let d3ConvId, d3SessionId;
     {
       const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      d3SessionId = sessionId;
       backend.reset();
-      const { result: withStart } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'nope', max_tokens: 64, async: true, start_conversation: true }, 2);
-      ok('async + start_conversation: isError', withStart?.isError === true, JSON.stringify(withStart));
-      ok('async + start_conversation: no request reached the backend', backend.requests.length === 0, String(backend.requests.length));
-      const text = textOf(withStart);
-      ok('async + start_conversation: framed as a scope limit, not "technically incompatible"', !/technically incompatible/i.test(text), text);
+      const { result: startResult } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'turn one', max_tokens: 64, async: true, start_conversation: true }, 500);
+      ok('async + start_conversation: not isError', startResult?.isError !== true, JSON.stringify(startResult));
+      const startText = textOf(startResult);
+      ok('async + start_conversation: no request reached the backend before the job runs', backend.requests.length === 0, String(backend.requests.length));
+      const jobId1 = startText.match(UUID_RE)?.[0];
+      ok('async + start_conversation: submitted with a job id', !!jobId1, startText);
+      ok('async + start_conversation: mentions a started conversation (0 turns so far)', /Started conversation/.test(startText) && /0 turns/.test(startText), startText);
+      const matches = [...startText.matchAll(UUID_RE_G)].map((m) => m[0]);
+      const convId = matches.find((m) => m !== jobId1);
+      ok('async + start_conversation: a second UUID (the conversation id) is present', !!convId, startText);
+      d3ConvId = convId;
 
+      await pollUntilDone(baseUrl, sessionId, jobId1, { idBase: 10000 });
+      const { result: listAfterStart } = await callConversations(baseUrl, sessionId, { action: 'list' }, 501);
+      ok('async + start_conversation: conversation has 2 turns after the job completes', convHasTurns(textOf(listAfterStart), convId, 2), textOf(listAfterStart));
+    }
+
+    // --- D2: async + conversation_id continues that conversation; upstream messages carry the prior turn ---
+    {
       backend.reset();
-      const { result: withConvId } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'nope', max_tokens: 64, async: true, conversation_id: '00000000-0000-0000-0000-000000000000' }, 3);
-      ok('async + conversation_id: isError', withConvId?.isError === true, JSON.stringify(withConvId));
-      ok('async + conversation_id: no request reached the backend', backend.requests.length === 0, String(backend.requests.length));
+      const { result: turn2Result } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'turn two', max_tokens: 64, async: true, conversation_id: d3ConvId }, 502);
+      const jobId2 = textOf(turn2Result).match(UUID_RE)?.[0];
+      ok('async + conversation_id continuation: submitted', !!jobId2, textOf(turn2Result));
+      const { text: turn2Text } = await pollUntilDone(baseUrl, d3SessionId, jobId2, { idBase: 10100 });
+      ok('async + conversation_id: job completes', turn2Text.includes('Hello, this is fake.'), turn2Text);
+      ok('async + conversation_id: completed result carries a conversation line', /💬 Conversation/.test(turn2Text), turn2Text);
+
+      // Structural pin (regression): the 2nd turn's upstream request is
+      // exactly [system, history-user, history-assistant, new-instruction]
+      // — the same shape the synchronous path has always produced, now
+      // shared via customPromptContextState()/messages assembly order
+      // (system -> history -> context/ack -> instruction).
+      ok('async + conversation_id: exactly one upstream request for this turn', backend.requests.length === 1, String(backend.requests.length));
+      const req2 = backend.requests[0];
+      const roles = (req2?.messages ?? []).map((m) => m.role);
+      ok('async + conversation_id: upstream messages are [system, user, assistant, user]', JSON.stringify(roles) === JSON.stringify(['system', 'user', 'assistant', 'user']), JSON.stringify(roles));
+      ok('async + conversation_id: history user turn is "turn one"', req2?.messages?.[1]?.content === 'turn one', JSON.stringify(req2?.messages?.[1]));
+      ok('async + conversation_id: new instruction is "turn two"', req2?.messages?.[3]?.content === 'turn two', JSON.stringify(req2?.messages?.[3]));
+    }
+
+    // --- D3: while a job is in flight for a conversation, every new call against it (any tool, sync or async) is rejected ---
+    {
+      backend.setFirstChunkDelayMs(4000); // keep the job running long enough to exercise D3
+      backend.reset();
+      const { result: blockerResult } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'blocker turn', max_tokens: 64, async: true, conversation_id: d3ConvId }, 503);
+      const blockerJobId = textOf(blockerResult).match(UUID_RE)?.[0];
+      ok('D3 setup: blocker job submitted', !!blockerJobId, textOf(blockerResult));
+
+      const requestsBeforeD3 = backend.requests.length;
+      const { result: d3Async } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'should be blocked', max_tokens: 64, async: true, conversation_id: d3ConvId, force_thinking: false }, 504);
+      ok('D3: a 2nd async submission to the same conversation is isError', d3Async?.isError === true, JSON.stringify(d3Async));
+      const { result: d3Sync } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'should be blocked', max_tokens: 64, conversation_id: d3ConvId }, 505);
+      ok('D3: a synchronous custom_prompt call to the same conversation is isError', d3Sync?.isError === true, JSON.stringify(d3Sync));
+      const { result: d3Chat } = await callChat(baseUrl, d3SessionId, { message: 'should be blocked', max_tokens: 64, conversation_id: d3ConvId }, 506);
+      ok('D3: a synchronous chat call to the same conversation is isError', d3Chat?.isError === true, JSON.stringify(d3Chat));
+      ok('D3: none of the three blocked calls reached the backend', backend.requests.length === requestsBeforeD3, String(backend.requests.length));
+
+      // D3 must not block an unrelated conversation or an unrelated owner.
+      backend.reset();
+      const { result: otherStart } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'unrelated turn', max_tokens: 64, async: true, start_conversation: true }, 507);
+      ok('D3 non-interference: an unrelated new conversation is not blocked', otherStart?.isError !== true, JSON.stringify(otherStart));
+      const otherJobId = textOf(otherStart).match(UUID_RE)?.[0];
+      if (otherJobId) await pollUntilDone(baseUrl, d3SessionId, otherJobId, { idBase: 10200 });
+
+      const { sessionId: otherOwnerSession } = await initializeSession(baseUrl, '/mcp');
+      const { result: crossOwnerResult } = await callCustomPrompt(baseUrl, otherOwnerSession, { instruction: 'cross-owner probe', max_tokens: 64, conversation_id: d3ConvId }, 508);
+      ok('D3 non-interference: a different owner gets the ordinary not-found error, not the busy error', crossOwnerResult?.isError === true && !/still in progress/i.test(textOf(crossOwnerResult)), textOf(crossOwnerResult));
+
+      backend.setFirstChunkDelayMs(0);
+      await pollUntilDone(baseUrl, d3SessionId, blockerJobId, { idBase: 10300 });
+    }
+
+    // --- D4 (a failed async job does not append turns) is verified in the "Failed job E2E Test" section
+    // below, against the dedicated always-erroring backend — see that section for the conversation checks.
+
+    // --- D5: a conversation deleted while its job is running does not silently lose the completion; the
+    // result says so instead of the turns vanishing unnoticed ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.setFirstChunkDelayMs(2000);
+      backend.reset();
+      const { result: d5Start } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'd5 turn one', max_tokens: 64, async: true, start_conversation: true }, 511);
+      const d5JobId = textOf(d5Start).match(UUID_RE)?.[0];
+      const d5ConvId = [...textOf(d5Start).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== d5JobId);
+      ok('D5 setup: job submitted with a conversation', !!d5JobId && !!d5ConvId, textOf(d5Start));
+
+      const { result: deleteResult } = await callConversations(baseUrl, sessionId, { action: 'delete', conversation_id: d5ConvId }, 512);
+      ok('D5 setup: conversation deleted while its job is still running', deleteResult?.isError !== true, JSON.stringify(deleteResult));
+
+      backend.setFirstChunkDelayMs(0);
+      const { text: d5Text } = await pollUntilDone(baseUrl, sessionId, d5JobId, { idBase: 10500 });
+      ok('D5: completion says the conversation was not updated (expired/deleted), rather than silently dropping it', /conversation expired; turns were not recorded/.test(d5Text), d5Text);
+    }
+
+    // --- ghost-append guard: deleting the JOB record (not the conversation) mid-flight must not let its
+    // completion append turns behind a later call's turns (found by plan-deep-check's Fable review) ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.setFirstChunkDelayMs(2000);
+      backend.reset();
+      const { result: ghostStart } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'ghost turn one', max_tokens: 64, async: true, start_conversation: true }, 513);
+      const ghostJobId = textOf(ghostStart).match(UUID_RE)?.[0];
+      const ghostConvId = [...textOf(ghostStart).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== ghostJobId);
+      ok('ghost-append setup: job submitted with a conversation', !!ghostJobId && !!ghostConvId, textOf(ghostStart));
+
+      const { result: jobDeleteResult } = await callJobs(baseUrl, sessionId, { action: 'delete', job_id: ghostJobId }, 514);
+      ok('ghost-append setup: job record deleted while it is still running', jobDeleteResult?.isError !== true, JSON.stringify(jobDeleteResult));
+
+      // With the job's D3 lock now released (its record is gone), a fresh
+      // synchronous call against the same conversation succeeds and records
+      // the "real" turn 2 before the deleted job's fn() finishes.
+      backend.setFirstChunkDelayMs(0);
+      const { result: legitTurn2 } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'ghost turn two (legit)', max_tokens: 64, conversation_id: ghostConvId }, 515);
+      ok('ghost-append: a fresh call to the same conversation succeeds once the job record is gone', legitTurn2?.isError !== true, JSON.stringify(legitTurn2));
+
+      // Give the deleted job's still-in-flight fn() time to finish and attempt its (guarded) append. The
+      // deleted job's own "turn one" is never recorded (it's still mid-flight when its record is deleted,
+      // so the ghost-append guard suppresses it) — the only turns that land are the legit call's, so the
+      // conversation should have exactly 2 turns, not 4 (which it would if the ghost append went through
+      // on top of the legit one) and not 0 (which it would if the guard also swallowed the legit call).
+      await new Promise((r) => setTimeout(r, 2500));
+      const { result: listAfterGhost } = await callConversations(baseUrl, sessionId, { action: 'list' }, 516);
+      ok('ghost-append: conversation has exactly 2 turns (only the legit call — the ghost job\'s append was suppressed, not doubled up)', convHasTurns(textOf(listAfterGhost), ghostConvId, 2), textOf(listAfterGhost));
+    }
+
+    // --- multi-tenant: owner A's async job never appends to owner B's conversation, even by (impossible) accident ---
+    {
+      const { sessionId: ownerA } = await initializeSession(baseUrl, '/mcp');
+      const { sessionId: ownerB } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result: bStart } = await callCustomPrompt(baseUrl, ownerB, { instruction: 'owner B turn one', max_tokens: 64, async: true, start_conversation: true }, 517);
+      const bJobId = textOf(bStart).match(UUID_RE)?.[0];
+      const bConvId = [...textOf(bStart).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== bJobId);
+      await pollUntilDone(baseUrl, ownerB, bJobId, { idBase: 10600 });
+
+      const { result: aCrossResult } = await callCustomPrompt(baseUrl, ownerA, { instruction: 'owner A trying to use B\'s conversation', max_tokens: 64, async: true, conversation_id: bConvId }, 518);
+      ok('multi-tenant: owner A cannot submit an async job against owner B\'s conversation_id', aCrossResult?.isError === true, JSON.stringify(aCrossResult));
+
+      const { result: bListAfter } = await callConversations(baseUrl, ownerB, { action: 'list' }, 519);
+      ok('multi-tenant: owner B\'s conversation is unaffected (still 2 turns)', convHasTurns(textOf(bListAfter), bConvId, 2), textOf(bListAfter));
+    }
+
+    // --- regression: async: true with no conversation params at all still produces the pre-15-1a message shape ---
+    {
+      backend.reset();
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const { result: plainAsync } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'plain async, no conversation', max_tokens: 64, async: true }, 520);
+      const plainJobId = textOf(plainAsync).match(UUID_RE)?.[0];
+      await pollUntilDone(baseUrl, sessionId, plainJobId, { idBase: 10700 });
+      ok('regression (async, no conversation): exactly one upstream request', backend.requests.length === 1, String(backend.requests.length));
+      const plainReq = backend.requests[0];
+      const plainRoles = (plainReq?.messages ?? []).map((m) => m.role);
+      ok('regression (async, no conversation): upstream messages are [system, user] only — no history, no context/ack pair', JSON.stringify(plainRoles) === JSON.stringify(['system', 'user']), JSON.stringify(plainRoles));
+    }
+
+    // --- regression: a synchronous custom_prompt conversation's 2nd-turn messages keep the exact pre-15-1a shape,
+    // now that customPromptContextState()/customPromptTurnsToStore() build them instead of inline logic ---
+    {
+      backend.reset();
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const { result: syncStart } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'sync turn one', max_tokens: 64, start_conversation: true }, 521);
+      const syncConvId = textOf(syncStart).match(UUID_RE)?.[0];
+      ok('regression (sync conversation) setup: started', !!syncConvId, textOf(syncStart));
+      backend.reset();
+      const { result: syncTurn2 } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'sync turn two', max_tokens: 64, conversation_id: syncConvId }, 522);
+      ok('regression (sync conversation): 2nd turn not isError', syncTurn2?.isError !== true, JSON.stringify(syncTurn2));
+      ok('regression (sync conversation): exactly one upstream request', backend.requests.length === 1, String(backend.requests.length));
+      const syncReq = backend.requests[0];
+      const syncRoles = (syncReq?.messages ?? []).map((m) => m.role);
+      ok('regression (sync conversation): upstream messages are [system, user, assistant, user]', JSON.stringify(syncRoles) === JSON.stringify(['system', 'user', 'assistant', 'user']), JSON.stringify(syncRoles));
+      ok('regression (sync conversation): history user turn is "sync turn one"', syncReq?.messages?.[1]?.content === 'sync turn one', JSON.stringify(syncReq?.messages?.[1]));
+      ok('regression (sync conversation): new instruction is "sync turn two"', syncReq?.messages?.[3]?.content === 'sync turn two', JSON.stringify(syncReq?.messages?.[3]));
     }
 
     // --- code_task_files: paths are read and validated synchronously at submit time (invalid path fails before any job is queued) ---
@@ -314,6 +499,16 @@ async function main() {
 
       const { result: listResult } = await callJobs(baseUrl2, sessionId, { action: 'list' }, 3);
       ok('failed job: list reports state failed', new RegExp(`${jobId}[^\\n]*failed`).test(textOf(listResult)), textOf(listResult));
+
+      // --- D4 (phase 15-1a): a failed async job does not append turns to its conversation ---
+      const { result: d4Start } = await callCustomPrompt(baseUrl2, sessionId, { instruction: 'd4 will fail', max_tokens: 64, async: true, start_conversation: true }, 4);
+      const d4JobId = textOf(d4Start).match(UUID_RE)?.[0];
+      const d4ConvId = [...textOf(d4Start).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== d4JobId);
+      ok('D4 setup: job submitted against a broken backend, with a new conversation', !!d4JobId && !!d4ConvId, textOf(d4Start));
+      const { text: d4Text } = await pollUntilDone(baseUrl2, sessionId, d4JobId, { idBase: 9600 });
+      ok('D4: the job reaches a terminal failed state', d4Text.startsWith('❌'), d4Text);
+      const { result: d4List } = await callConversations(baseUrl2, sessionId, { action: 'list' }, 5);
+      ok('D4: the conversation still has 0 turns — the failed job did not append anything', convHasTurns(textOf(d4List), d4ConvId, 0), textOf(d4List));
     } finally {
       child2.kill();
       await errorBackend.close();
