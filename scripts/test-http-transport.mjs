@@ -10,6 +10,8 @@
 import { startFakeBackend } from './fake-openai-backend.mjs';
 import { getFreePort, startServer, post, initializeSession } from './http-test-helpers.mjs';
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
   if (cond) {
@@ -92,6 +94,85 @@ async function main() {
     check('concurrent session C received only its own progress token',
       progressC.length > 0 && progressC.every((m) => m.params.progressToken === tokenC));
     check('two concurrent sessions were issued distinct session ids', sessB.sessionId !== sessC.sessionId);
+
+    // === HTTP session idle TTL tests ===
+    // Spawn a dedicated server with TTL = 0.03 min (1800 ms) so existing tests
+    // are never affected by the setting.
+    console.log('\n=== HTTP Session TTL Tests ===\n');
+
+    const ttlBackend = await startFakeBackend();
+    const ttlPort = await getFreePort();
+    const { child: ttlChild, ready: ttlReady } = startServer(ttlBackend.url, ttlPort, {
+      HOUTINI_LM_HTTP_SESSION_TTL_MIN: '0.03',
+    });
+    const ttlBaseUrl = `http://127.0.0.1:${ttlPort}`;
+    await ttlReady;
+
+    try {
+
+      // 1. Session used inside the TTL window survives
+      {
+        const { sessionId } = await initializeSession(ttlBaseUrl, '/mcp');
+        await sleep(600);
+        const res = await post(ttlBaseUrl, '/mcp', { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, sessionId);
+        check('session used inside the TTL window survives', res.status === 200, `got ${res.status}`);
+      }
+
+      // 2. Idle session past the TTL is reaped (404 on next use)
+      {
+        const { sessionId } = await initializeSession(ttlBaseUrl, '/mcp');
+        await sleep(2500);
+        const res = await post(ttlBaseUrl, '/mcp', { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, sessionId);
+        check('idle session past the TTL is reaped (404 on next use)', res.status === 404, `got ${res.status}`);
+      }
+
+      // 3. An in-flight request is not reaped mid-call
+      {
+        // Reset the dedicated backend's delay to 3000ms so the call takes long enough
+        ttlBackend.setFirstChunkDelayMs(3000);
+        const { sessionId: sidA } = await initializeSession(ttlBaseUrl, '/mcp');
+        // Fire a tools/call but don't await yet (use a promise so we can let it run)
+        const callPromise = post(ttlBaseUrl, '/mcp', {
+          jsonrpc: '2.0', id: 2, method: 'tools/call',
+          params: { name: 'chat', arguments: { message: 'hi', max_tokens: 64 } },
+        }, sidA);
+        await sleep(2500);
+        // The reaping trigger — session B's request will call reapIdleSessions
+        const { sessionId: sidB } = await initializeSession(ttlBaseUrl, '/mcp');
+        const callRes = await callPromise;
+        check('an in-flight request is not reaped mid-call', callRes.status === 200, `got ${callRes.status}`);
+        ttlBackend.setFirstChunkDelayMs(0);
+      }
+
+      // 4. A session owning a running async job is not reaped
+      {
+        ttlBackend.setFirstChunkDelayMs(3000);
+        const { sessionId } = await initializeSession(ttlBaseUrl, '/mcp');
+        // Submit an async job by calling custom_prompt with async: true
+        const jobRes = await post(ttlBaseUrl, '/mcp', {
+          jsonrpc: '2.0', id: 2, method: 'tools/call',
+          params: { name: 'custom_prompt', arguments: { instruction: 'test', async: true } },
+        }, sessionId);
+        await sleep(2500);
+        // Calling tools/list on the same session should still work (session NOT reaped)
+        const listRes = await post(ttlBaseUrl, '/mcp', { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }, sessionId);
+        check('a session owning a running async job is not reaped', listRes.status === 200, `got ${listRes.status}`);
+        ttlBackend.setFirstChunkDelayMs(0);
+      }
+
+    } finally {
+      ttlChild.kill();
+      await ttlBackend.close();
+    }
+
+    // 5. Default config (TTL unset) never reaps an idle session
+    // Uses the original (main) server instance which has no TTL set.
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      await sleep(2500);
+      const res = await post(baseUrl, '/mcp', { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, sessionId);
+      check('default config (TTL unset) never reaps an idle session', res.status === 200, `got ${res.status}`);
+    }
 
     console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   } finally {
