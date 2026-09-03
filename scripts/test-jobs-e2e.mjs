@@ -293,6 +293,14 @@ async function main() {
       const blockerJobId = textOf(blockerResult).match(UUID_RE)?.[0];
       ok('D3 setup: blocker job submitted', !!blockerJobId, textOf(blockerResult));
 
+      // Phase 15-1b: let the blocker job's own upstream request land before
+      // taking the baseline below — without this wait, that request can
+      // still be in flight when the baseline is captured and then land
+      // during one of the blocked calls below, false-failing the "none of
+      // the blocked calls reached the backend" check (observed flaky
+      // without this wait; see the cross-tool D3 test further down for the
+      // same fix with a fuller explanation).
+      await new Promise((r) => setTimeout(r, 300));
       const requestsBeforeD3 = backend.requests.length;
       const { result: d3Async } = await callCustomPrompt(baseUrl, d3SessionId, { instruction: 'should be blocked', max_tokens: 64, async: true, conversation_id: d3ConvId, force_thinking: false }, 504);
       ok('D3: a 2nd async submission to the same conversation is isError', d3Async?.isError === true, JSON.stringify(d3Async));
@@ -436,6 +444,133 @@ async function main() {
         const { text } = await pollUntilDone(baseUrl, sessionId, jobId, { idBase: 7000 });
         ok('code_task_files async job completes with the fake backend\'s content', text.includes('Hello, this is fake.'), text);
       }
+    }
+
+    // --- phase 15-1b: code_task_files now accepts start_conversation/conversation_id, and can continue a
+    // conversation started by custom_prompt (and vice versa) — the file bundle itself is never recorded into
+    // history, only a manifest line. See .claude/phases/phase15-async-conversations.md ---
+
+    // --- cross-tool continuation, direction 1: custom_prompt starts, code_task_files continues ---
+    let ctfConvId, ctfSessionId;
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      ctfSessionId = sessionId;
+      backend.reset();
+      const { result: cpStart } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'cross-tool turn one', max_tokens: 64, async: true, start_conversation: true }, 600);
+      const cpJobId = textOf(cpStart).match(UUID_RE)?.[0];
+      const convId = [...textOf(cpStart).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== cpJobId);
+      ok('cross-tool setup: custom_prompt started a conversation', !!cpJobId && !!convId, textOf(cpStart));
+      ctfConvId = convId;
+      await pollUntilDone(baseUrl, sessionId, cpJobId, { idBase: 11000 });
+
+      backend.reset();
+      const { result: ctfContinue } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'cross-tool task', async: true, conversation_id: convId }, 601);
+      const ctfJobId = textOf(ctfContinue).match(UUID_RE)?.[0];
+      ok('cross-tool: code_task_files continuation submitted', !!ctfJobId, textOf(ctfContinue));
+      ok('cross-tool: no backend request before the job runs', backend.requests.length === 0, String(backend.requests.length));
+      await pollUntilDone(baseUrl, sessionId, ctfJobId, { idBase: 11100 });
+
+      ok('cross-tool: exactly one upstream request for this turn', backend.requests.length === 1, String(backend.requests.length));
+      const req = backend.requests[0];
+      const roles = (req?.messages ?? []).map((m) => m.role);
+      ok(
+        'cross-tool: upstream messages are [system, history-user, history-assistant, file-bundle-user, bundle-ack, manifest-user]',
+        JSON.stringify(roles) === JSON.stringify(['system', 'user', 'assistant', 'user', 'assistant', 'user']),
+        JSON.stringify(roles),
+      );
+      ok('cross-tool: history carries custom_prompt\'s turn-one instruction', req?.messages?.[1]?.content === 'cross-tool turn one', JSON.stringify(req?.messages?.[1]));
+      const fileBundleContent = req?.messages?.[3]?.content ?? '';
+      ok('cross-tool: the file bundle turn is present in what was actually sent to the model', fileBundleContent.startsWith('```unknown\n==='), fileBundleContent.slice(0, 120));
+      ok('cross-tool: file bundle turn is followed by the bundle ack', req?.messages?.[4]?.content === 'Files received. Awaiting the task.', JSON.stringify(req?.messages?.[4]));
+      ok('cross-tool: final user turn is the manifest + task, not the file bundle', /^\[files\]/.test(req?.messages?.[5]?.content ?? ''), JSON.stringify(req?.messages?.[5]));
+
+      const { result: listAfterCtf } = await callConversations(baseUrl, sessionId, { action: 'list' }, 602);
+      ok('cross-tool: conversation has 4 turns after both tools have contributed', convHasTurns(textOf(listAfterCtf), convId, 4), textOf(listAfterCtf));
+    }
+
+    // --- cross-tool continuation, direction 2: continuing with custom_prompt after code_task_files — the
+    // file bundle from the code_task_files turn must NOT appear in history, only its manifest line ---
+    {
+      backend.reset();
+      const { result: cpContinue } = await callCustomPrompt(baseUrl, ctfSessionId, { instruction: 'cross-tool turn three', max_tokens: 64, conversation_id: ctfConvId }, 603);
+      ok('cross-tool (custom_prompt after code_task_files): not isError', cpContinue?.isError !== true, JSON.stringify(cpContinue));
+      ok('cross-tool: exactly one upstream request', backend.requests.length === 1, String(backend.requests.length));
+      const req = backend.requests[0];
+      const historyContents = (req?.messages ?? []).slice(1, -1).map((m) => m.content).join('\n');
+      ok('cross-tool: history sent to the model contains no code-fence or file-header markers — the file bundle itself was never recorded',
+        !historyContents.includes('```') && !historyContents.includes('=== '), historyContents.slice(0, 300));
+      ok('cross-tool: history does contain the manifest line from the code_task_files turn', /\[files\]/.test(historyContents), historyContents.slice(0, 300));
+    }
+
+    // --- D3, cross-tool: a code_task_files job held in flight blocks async/sync custom_prompt, sync chat,
+    // and sync code_task_files against the same conversation ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result: startResult } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'd3b turn one', max_tokens: 64, async: true, start_conversation: true }, 610);
+      const startJobId = textOf(startResult).match(UUID_RE)?.[0];
+      const d3bConvId = [...textOf(startResult).matchAll(UUID_RE_G)].map((m) => m[0]).find((m) => m !== startJobId);
+      await pollUntilDone(baseUrl, sessionId, startJobId, { idBase: 11200 });
+
+      backend.setFirstChunkDelayMs(4000); // keep the code_task_files job running long enough to exercise D3
+      backend.reset();
+      const { result: blockerResult } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'blocker', async: true, conversation_id: d3bConvId }, 611);
+      const blockerJobId = textOf(blockerResult).match(UUID_RE)?.[0];
+      ok('D3 cross-tool setup: code_task_files blocker job submitted', !!blockerJobId, textOf(blockerResult));
+
+      // Let the blocker job's own upstream request land before taking the
+      // baseline below — code_task_files' fn() does a file read before its
+      // chatCompletionStreaming() call, and that read is enough of an event
+      // loop yield for the request to still be in flight right after submit
+      // returns. Without this wait, one of the four blocked calls' own
+      // (unrelated) file read could yield long enough for the blocker's
+      // request to land AFTER the baseline is captured, false-failing this
+      // check.
+      await new Promise((r) => setTimeout(r, 300));
+      const requestsBeforeD3b = backend.requests.length;
+      const { result: d3bAsync } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'blocked', max_tokens: 64, async: true, conversation_id: d3bConvId }, 612);
+      ok('D3 cross-tool: async custom_prompt against the same conversation is isError', d3bAsync?.isError === true, JSON.stringify(d3bAsync));
+      const { result: d3bSync } = await callCustomPrompt(baseUrl, sessionId, { instruction: 'blocked', max_tokens: 64, conversation_id: d3bConvId }, 613);
+      ok('D3 cross-tool: sync custom_prompt against the same conversation is isError', d3bSync?.isError === true, JSON.stringify(d3bSync));
+      const { result: d3bChat } = await callChat(baseUrl, sessionId, { message: 'blocked', max_tokens: 64, conversation_id: d3bConvId }, 614);
+      ok('D3 cross-tool: sync chat against the same conversation is isError', d3bChat?.isError === true, JSON.stringify(d3bChat));
+      const { result: d3bCtfSync } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'blocked', conversation_id: d3bConvId }, 615);
+      ok('D3 cross-tool: sync code_task_files against the same conversation is isError', d3bCtfSync?.isError === true, JSON.stringify(d3bCtfSync));
+      ok('D3 cross-tool: none of the four blocked calls reached the backend', backend.requests.length === requestsBeforeD3b, String(backend.requests.length));
+
+      backend.setFirstChunkDelayMs(0);
+      await pollUntilDone(baseUrl, sessionId, blockerJobId, { idBase: 11300 });
+    }
+
+    // --- regression: code_task_files async with no conversation params keeps its pre-15-1b shape ---
+    {
+      backend.reset();
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      const { result: plainResult } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'plain regression', async: true }, 620);
+      const plainSubmitText = textOf(plainResult);
+      ok('regression (code_task_files async, no conversation): submitted, no "Started conversation" line', /submitted/i.test(plainSubmitText) && !/Started conversation/.test(plainSubmitText), plainSubmitText);
+      const plainJobId = plainSubmitText.match(UUID_RE)?.[0];
+      await pollUntilDone(baseUrl, sessionId, plainJobId, { idBase: 11400 });
+      ok('regression (code_task_files async, no conversation): exactly one upstream request', backend.requests.length === 1, String(backend.requests.length));
+      const plainReq = backend.requests[0];
+      const plainRoles = (plainReq?.messages ?? []).map((m) => m.role);
+      ok('regression (code_task_files async, no conversation): upstream messages are [system, user] only', JSON.stringify(plainRoles) === JSON.stringify(['system', 'user']), JSON.stringify(plainRoles));
+
+      // Task 4/task 11 (plan-deep-check finding): estimatePrefill()'s input must stay combined.length for
+      // the non-conversation case, so formatJobSubmitted()'s text (which embeds the estimate) must not
+      // shift merely because conversation support now exists in the code path. Two identical calls with
+      // no conversation params should produce the identical submitted-response shape, job id aside.
+      backend.reset();
+      const { result: plainResult2 } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'plain regression', async: true }, 621);
+      const plainSubmitText2 = textOf(plainResult2);
+      const stripJobId = (s) => s.replace(UUID_RE_G, '<job-id>');
+      ok(
+        'regression (code_task_files async, no conversation): repeated identical call produces the same submitted-response shape (job id aside)',
+        stripJobId(plainSubmitText) === stripJobId(plainSubmitText2),
+        `${plainSubmitText}\n---\n${plainSubmitText2}`,
+      );
+      const plainJobId2 = plainSubmitText2.match(UUID_RE)?.[0];
+      await pollUntilDone(baseUrl, sessionId, plainJobId2, { idBase: 11500 });
     }
 
     // --- active job limit: HOUTINI_LM_JOB_ACTIVE_MAX_PER_OWNER (default 2) blocks a 3rd concurrent submission for the same owner ---

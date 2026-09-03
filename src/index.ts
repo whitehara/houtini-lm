@@ -2756,6 +2756,39 @@ const CONVERSATION_PROPS = {
   },
 } as const;
 
+// code_task_files' equivalent of CONVERSATION_PROPS (phase 15-1b). A
+// separate object, not a reuse of CONVERSATION_PROPS, because the semantics
+// differ enough to need their own wording: the file bundle itself is never
+// stored in history (see formatCodeTaskFilesManifest) — only a manifest
+// line naming what was read, plus the task and the response — and every
+// call re-reads the current file contents from disk regardless of what a
+// prior turn saw. The same D3 same-conversation exclusion rule applies
+// (shared via resolveConversation()), so that sentence is repeated here
+// verbatim rather than cross-referenced, matching CONVERSATION_PROPS's own
+// self-contained style.
+const CODE_TASK_FILES_CONVERSATION_PROPS = {
+  start_conversation: {
+    type: 'boolean',
+    description:
+      'By default this server remembers nothing between calls — every call is stateless unless you opt in here. ' +
+      'Set true to start a new server-side conversation — the id is returned on the last line of the response. ' +
+      'The file bundle itself is NOT recorded into history — only a manifest line (which files were read) plus ' +
+      'the task and the response. Every call re-reads paths fresh from disk; nothing about file contents carries ' +
+      'over between turns. On every following call, pass the id as conversation_id. Use the conversations tool to ' +
+      'list or discard conversations you\'ve started.',
+  },
+  conversation_id: {
+    type: 'string',
+    description:
+      'Continue a conversation previously started with start_conversation: true (on this tool or on custom_prompt ' +
+      '— they share the same conversation store). Send paths and task as normal; the server prepends the stored ' +
+      'history (manifest lines + tasks + responses from earlier turns, never raw file contents) automatically. ' +
+      'While a job is pending/running for this conversation (submitted with async: true, on this tool or ' +
+      'custom_prompt), any new call against it — async or synchronous, either tool — is rejected until that job ' +
+      'completes; poll it with the jobs tool instead of submitting another.',
+  },
+} as const;
+
 // custom_prompt's context/ack exchange (see the multi-turn comment at its
 // call site below) as shared constants, so the string that gets recorded
 // into conversation history and the string checked for "was this context
@@ -2763,6 +2796,36 @@ const CONVERSATION_PROPS = {
 const CUSTOM_PROMPT_CONTEXT_PREFIX = 'Here is the context for analysis:\n\n';
 const CUSTOM_PROMPT_CONTEXT_ACK =
   'Understood. I have read the full context. What would you like me to do with it?';
+
+// code_task_files' equivalent of CUSTOM_PROMPT_CONTEXT_ACK (phase 15-1b) —
+// the fake assistant turn acknowledging the file bundle before the manifest
+// + task turn. Unlike custom_prompt's context, the file bundle is never
+// recorded into history (see formatCodeTaskFilesManifest below for why), so
+// there is no matching "prefix" constant to dedup against — this ack is
+// pushed unconditionally whenever a conversation is active.
+const CODE_TASK_FILES_BUNDLE_ACK = 'Files received. Awaiting the task.';
+
+/**
+ * The manifest line recorded into conversation history in place of the file
+ * bundle itself (phase 15-1b). Recording the actual file contents would hit
+ * the same problem phase 14-5/D6 deliberately deferred for blobs: files can
+ * be arbitrarily large relative to HOUTINI_LM_CONVERSATION_MAX_CHARS, so a
+ * single turn could evict the entire rest of the history. Only successfully
+ * read files are named — a failed read was never seen by the model, so
+ * listing it here would leave a later turn reasoning about a file the
+ * history claims was read but wasn't. Callers pass base names only (not
+ * full paths, and already filtered to successful reads) to keep the line
+ * short and this function free of path-shape assumptions; truncated to the
+ * first 10 with a "(+N more)" suffix for large bundles.
+ */
+function formatCodeTaskFilesManifest(readNames: string[], totalRequested: number, combinedChars: number): string {
+  const shown = readNames.slice(0, 10);
+  const more = readNames.length > 10 ? ` (+${readNames.length - 10} more)` : '';
+  const countLabel = readNames.length === totalRequested
+    ? `${readNames.length} file(s) read`
+    : `${readNames.length}/${totalRequested} file(s) read`;
+  return `[files] ${shown.join(', ')}${more} — ${countLabel}, ${combinedChars} chars`;
+}
 
 // Added to custom_prompt's and code_task_files' inputSchema.properties when
 // JOBS_ENABLED (see the conditional spreads in TOOLS below) — mirrors the
@@ -2788,10 +2851,6 @@ const ASYNC_PROPS = {
 // branches (see resolveConversation()'s CONVERSATIONS_DISABLED_MESSAGE for
 // the same pattern) — one literal, so the wording can never drift between them.
 const JOBS_DISABLED_MESSAGE = 'Error: async jobs are disabled on this houtini-lm instance (HOUTINI_LM_JOBS=0).';
-const ASYNC_WITH_CONVERSATION_MESSAGE =
-  'Error: async: true does not currently support start_conversation/conversation_id together — this is a scope ' +
-  'limit for the initial release, not a technical incompatibility, and may be lifted later. Submit without the ' +
-  'conversation params when using async: true, or drop async: true to use a conversation.';
 
 // Added to custom_prompt's inputSchema.properties when BLOBS_ENABLED (see
 // the conditional spread in TOOLS below) — mirrors ASYNC_PROPS's pattern.
@@ -2816,8 +2875,8 @@ const BLOB_PROPS = {
 } as const;
 
 // Shared verbatim across custom_prompt's context_blob_id branch (see
-// ASYNC_WITH_CONVERSATION_MESSAGE for the same pattern) — one literal, so
-// the wording can never drift.
+// JOBS_DISABLED_MESSAGE for the same pattern) — one literal, so the wording
+// can never drift.
 const BLOB_WITH_CONTEXT_MESSAGE =
   'Error: context and context_blob_id cannot both be set — context_blob_id supplies the context out-of-band, so ' +
   'sending both is redundant. Use one or the other.';
@@ -3119,6 +3178,7 @@ const TOOLS: Tool[] = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...(CONVERSATIONS_ENABLED ? CODE_TASK_FILES_CONVERSATION_PROPS : {}),
         ...(JOBS_ENABLED ? ASYNC_PROPS : {}),
         ...REASONING_PROPS,
         ...SAMPLING_PROPS,
@@ -3794,7 +3854,10 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
       }
 
       case 'code_task_files': {
-        const { paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking, async: asyncFlag } = args as {
+        const {
+          paths, task, language, max_tokens: codeMaxTokens, model, include_reasoning, force_thinking,
+          async: asyncFlag, start_conversation, conversation_id,
+        } = args as {
           paths: string[];
           task: string;
           language?: string;
@@ -3803,6 +3866,8 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           include_reasoning?: boolean;
           force_thinking?: boolean;
           async?: boolean;
+          start_conversation?: boolean;
+          conversation_id?: string;
         };
 
         if (!Array.isArray(paths) || paths.length === 0) {
@@ -3829,11 +3894,16 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         );
 
         const sections: string[] = [];
+        // Phase 15-1b: basenames of successfully-read files only, in read
+        // order — feeds formatCodeTaskFilesManifest() below. A failed read
+        // is never named here (see that function's doc comment for why).
+        const readNames: string[] = [];
         let successCount = 0;
         reads.forEach((r, i) => {
           const p = paths[i];
           if (r.status === 'fulfilled') {
             successCount++;
+            readNames.push(basename(p));
             sections.push(`=== ${basename(p)} (${p}) ===\n${r.value.content}`);
           } else {
             const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
@@ -3848,10 +3918,55 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           };
         }
 
+        // Phase 15-1b: resolved once files are read (so a bad path fails
+        // before any conversation state is touched) and before routeToModel()
+        // (a no-op for the CONVERSATIONS_ENABLED=false / no-params case, but
+        // keeping the ordering fixed avoids two different call orders to
+        // reason about). Synchronous — no `await` — so this does not disturb
+        // any race-free placement further below.
+        const conv = resolveConversation(start_conversation, conversation_id, extra);
+        if (conv.kind === 'error') return conv.result;
+        const history: ConversationTurn[] = conv.kind === 'active' ? conv.history : [];
+
         const lang = language || 'unknown';
         const route = await routeToModel('code', model);
 
         const combined = sections.join('\n\n');
+
+        // codeMessages built here — before the prefill estimate — because
+        // estimatePrefill() below needs its total length when a conversation
+        // is active (task 7). Non-conversation shape is UNCHANGED from
+        // before phase 15-1b: exactly [system, user(fileBundle)], byte for
+        // byte, so a call without start_conversation/conversation_id is
+        // completely unaffected by this refactor.
+        const systemMessage: ChatMessage = {
+          role: 'system',
+          content: buildSystemPrompt({
+            base: `You are a senior ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output.`,
+            formatLine: 'Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.',
+            modelConstraint: route.hints.outputConstraint,
+          }),
+        };
+        const fileBundleMessage: ChatMessage = {
+          role: 'user',
+          content: `\`\`\`${lang}\n${combined}\n\`\`\``,
+        };
+        // The manifest + task turn recorded into history in place of the
+        // file bundle (phase 15-1b, D6-analogue) — see
+        // formatCodeTaskFilesManifest()'s doc comment for why the bundle
+        // itself is never stored. Computed unconditionally (cheap) even
+        // though it's only used when conv.kind === 'active', since the sync
+        // path and the async fn() closure both need the identical string.
+        const manifestLine = formatCodeTaskFilesManifest(readNames, paths.length, combined.length);
+        const codeMessages: ChatMessage[] = conv.kind === 'active'
+          ? [
+              systemMessage,
+              ...history,
+              fileBundleMessage,
+              { role: 'assistant', content: CODE_TASK_FILES_BUNDLE_ACK },
+              { role: 'user', content: `${manifestLine}\n\n${task}` },
+            ]
+          : [systemMessage, fileBundleMessage];
 
         // Pre-flight prefill estimate. Huge inputs can legitimately exceed
         // the MCP client's ~60s request timeout during prompt processing, and
@@ -3865,7 +3980,15 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         // Separates fixed per-request overhead from per-token prefill cost and
         // avoids the under-prediction a ratio-of-averages produces on inputs
         // much larger than the historical mean.
-        const estimate = await estimatePrefill(combined.length, route.modelId);
+        //
+        // Phase 15-1b: when no conversation is active this is `combined.length`
+        // unchanged (1 character the same as before this phase); when active,
+        // the full codeMessages total is used instead, since that (not just
+        // the file bundle) is what actually gets sent to the model.
+        const estimateInputChars = conv.kind === 'active'
+          ? codeMessages.reduce((n, m) => n + m.content.length, 0)
+          : combined.length;
+        const estimate = await estimatePrefill(estimateInputChars, route.modelId);
         // A poor fit (low R² — e.g. bimodal samples straddling a backend
         // restart with different perf settings) must not refuse the call: a
         // false refusal is worse than a false-ok that the prefill keepalive
@@ -3907,21 +4030,6 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           );
         }
 
-        const codeMessages: ChatMessage[] = [
-          {
-            role: 'system',
-            content: buildSystemPrompt({
-              base: `You are a senior ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output.`,
-              formatLine: 'Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.',
-              modelConstraint: route.hints.outputConstraint,
-            }),
-          },
-          {
-            role: 'user',
-            content: `\`\`\`${lang}\n${combined}\n\`\`\``,
-          },
-        ];
-
         // Computed before the sync/async branch below — it depends only on
         // the already-completed file reads, not on the model response.
         const readSummary = successCount === paths.length
@@ -3930,36 +4038,53 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         const codeSampling = extractSamplingParams(args as Record<string, unknown>);
 
-        // async: true (phase 13) — submit as a background job instead of
-        // running inline. Files are already read and validated above (at
-        // this point in the handler, unconditionally) — an invalid path
-        // fails synchronously at submit time, before any job is queued.
-        // Checked here, after the shared read/route/estimate work above (so
-        // the same estimate feeds formatJobSubmitted's prefillSecEstimate)
-        // but before touching the model.
+        // async: true (phase 13; phase 15-1b lifts the earlier
+        // conversation-params rejection) — submit as a background job
+        // instead of running inline. Files are already read and validated
+        // above (at this point in the handler, unconditionally) — an
+        // invalid path fails synchronously at submit time, before any job
+        // is queued. Checked here, after the shared read/route/estimate
+        // work above (so the same estimate feeds formatJobSubmitted's
+        // prefillSecEstimate) but before touching the model.
         if (asyncFlag === true) {
           if (!JOBS_ENABLED) {
             return { content: [{ type: 'text', text: JOBS_DISABLED_MESSAGE }], isError: true };
           }
-          // code_task_files has no start_conversation/conversation_id in its
-          // own schema (only chat/custom_prompt do), but guard defensively
-          // against a caller sending them anyway — same rejection as
-          // custom_prompt's async branch, for the same reason.
-          const rawArgs = args as Record<string, unknown>;
-          if (rawArgs.start_conversation !== undefined || rawArgs.conversation_id !== undefined) {
-            return { content: [{ type: 'text', text: ASYNC_WITH_CONVERSATION_MESSAGE }], isError: true };
-          }
           const ownerResult = resolveJobOwner(extra);
           if (ownerResult.kind === 'error') return ownerResult.result;
           const owner = ownerResult.owner;
+
+          // Phase 15-1b: same D3 re-check + conversation-snapshot re-check
+          // as custom_prompt's async branch (see that call site's comment
+          // for the full rationale). The window here is wider than
+          // custom_prompt's — file reads plus estimatePrefill()'s await, both
+          // above — so this re-check is not optional.
+          if (conv.kind === 'active') {
+            const busyJobIds = jobs.activeJobIdsForConversation(conv.owner, conv.id);
+            if (busyJobIds.length > 0) {
+              return conversationBusyError(conv.id, busyJobIds);
+            }
+            const currentHistory = conversations.get(conv.owner, conv.id);
+            if (currentHistory === undefined || currentHistory.length !== conv.historyLength) {
+              return {
+                content: [{
+                  type: 'text',
+                  text:
+                    `Error: conversation ${conv.id} changed since this call started (its turn count no longer ` +
+                    `matches what was read). Retry the call to pick up the latest history before submitting.`,
+                }],
+                isError: true,
+              };
+            }
+          }
           const limitError = jobActiveLimitError(owner);
           if (limitError) return limitError;
 
-          const fn = async (): Promise<string> => {
+          const fn = async (jobId: string): Promise<string> => {
             // Pass codeMaxTokens raw (not `?? DEFAULT_MAX_TOKENS`) so the
             // 25%-of-context auto-derivation in chatCompletionStreamingInner
             // fires when the caller omits it — matches the sync path.
-            const { text } = await runInference(codeMessages, {
+            const { text, resp } = await runInference(codeMessages, {
               temperature: route.hints.codeTemp,
               maxTokens: validMaxTokens(codeMaxTokens),
               model: route.modelId,
@@ -3973,18 +4098,33 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
               // No MCP progress channel threaded through here — see
               // custom_prompt's async branch for why.
             });
-            return text + suggestionLine;
+            const resultText = text + suggestionLine;
+            if (conv.kind !== 'active') {
+              return resultText;
+            }
+            // Ghost-append guard — identical rationale to custom_prompt's
+            // async branch (see that fn()'s comment): `jobs delete`/`jobs
+            // clear` don't stop this in-flight call, so without this check a
+            // deleted job's completion could still append behind newer turns.
+            if (jobs.get(owner, jobId) === undefined) {
+              return `${resultText}\nconversation not updated; the job record was deleted before completion`;
+            }
+            const turnsToStore = customPromptTurnsToStore(`${manifestLine}\n\n${task}`, resp.content);
+            const conversationLine = recordConversationTurns(conv, turnsToStore);
+            return resultText + conversationLine;
           };
 
-          const jobId = submitJob(owner, 'code_task_files', fn);
-          return {
-            content: [{ type: 'text', text: formatJobSubmitted(jobId, 'code_task_files', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN) }],
-          };
+          const jobId = submitJob(owner, 'code_task_files', fn, conv.kind === 'active' ? conv.id : undefined);
+          let submittedText = formatJobSubmitted(jobId, 'code_task_files', estimate.inputTokens, Math.round(estimate.estimatedSeconds), JOB_TTL_MIN);
+          if (conv.kind === 'active' && conversation_id === undefined && start_conversation === true) {
+            submittedText += `\nStarted conversation ${conv.id} (0 turns so far — turns are recorded once this job completes).`;
+          }
+          return { content: [{ type: 'text', text: submittedText }] };
         }
 
         // Pass codeMaxTokens raw (not `?? DEFAULT_MAX_TOKENS`) so the 25%-of-context
         // auto-derivation in chatCompletionStreamingInner fires when the caller omits it.
-        const { text } = await runInference(codeMessages, {
+        const { text, resp } = await runInference(codeMessages, {
           temperature: route.hints.codeTemp,
           maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
@@ -3995,7 +4135,12 @@ const handleCallTool = async (request: CallToolRequest, extra: HoutiniExtra): Pr
           includeReasoning: include_reasoning,
           footerExtra: `${lang} · ${readSummary}`,
         });
-        return { content: [{ type: 'text', text: text + suggestionLine }] };
+        let resultText = text + suggestionLine;
+        if (conv.kind === 'active') {
+          const turnsToStore = customPromptTurnsToStore(`${manifestLine}\n\n${task}`, resp.content);
+          resultText += recordConversationTurns(conv, turnsToStore);
+        }
+        return { content: [{ type: 'text', text: resultText }] };
       }
 
       case 'discover': {
