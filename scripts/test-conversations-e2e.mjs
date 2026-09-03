@@ -12,8 +12,11 @@
  *
  * Usage: node scripts/test-conversations-e2e.mjs
  */
+import { fileURLToPath } from 'node:url';
 import { startFakeBackend } from './fake-openai-backend.mjs';
 import { getFreePort, startServer, post, initializeSession } from './http-test-helpers.mjs';
+
+const thisFile = fileURLToPath(import.meta.url);
 
 let failed = 0;
 function ok(name, cond, detail) {
@@ -47,6 +50,16 @@ async function callCustomPrompt(baseUrl, sessionId, args, id, extraHeaders = {})
 /** Calls the `conversations` management tool (phase 9, phase 4). */
 async function callConversations(baseUrl, sessionId, args, id, extraHeaders = {}) {
   return callTool(baseUrl, sessionId, 'conversations', args, id, extraHeaders);
+}
+
+/** Calls the `code_task_files` tool (phase 15-1b: conversation continuation). */
+async function callCodeTaskFiles(baseUrl, sessionId, args, id, extraHeaders = {}) {
+  return callTool(baseUrl, sessionId, 'code_task_files', args, id, extraHeaders);
+}
+
+/** True if `conversations list`'s markdown table shows exactly `n` turns for `convId` (mirrors test-jobs-e2e.mjs's convHasTurns). */
+function convHasTurns(listText, convId, n) {
+  return new RegExp(`\\|\\s*${convId}\\s*\\|\\s*${n}\\s*\\|`).test(listText);
 }
 
 /** Fetches tools/list and returns its result (the { tools: [...] } payload). */
@@ -251,6 +264,64 @@ async function main() {
       const props = customPrompt?.inputSchema?.properties ?? {};
       ok('tools/list: custom_prompt.inputSchema.properties has start_conversation', 'start_conversation' in props, JSON.stringify(Object.keys(props)));
       ok('tools/list: custom_prompt.inputSchema.properties has conversation_id', 'conversation_id' in props, JSON.stringify(Object.keys(props)));
+      // Phase 15-1b: code_task_files gained the same two params.
+      const codeTaskFiles = (list?.tools ?? []).find((t) => t.name === 'code_task_files');
+      const ctfProps = codeTaskFiles?.inputSchema?.properties ?? {};
+      ok('tools/list: code_task_files.inputSchema.properties has start_conversation', 'start_conversation' in ctfProps, JSON.stringify(Object.keys(ctfProps)));
+      ok('tools/list: code_task_files.inputSchema.properties has conversation_id', 'conversation_id' in ctfProps, JSON.stringify(Object.keys(ctfProps)));
+    }
+
+    // === code_task_files conversation continuation (phase 15-1b) ===
+    console.log('\n=== code_task_files Conversation E2E Tests (phase 15-1b) ===\n');
+
+    // --- synchronous 2-turn continuation: turns accumulate, the conversation shows up in `conversations
+    // list`, and the file bundle itself is never recorded — only manifest lines ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const { result: turn1 } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'sync turn one', start_conversation: true }, 2);
+      ok('code_task_files sync conversation turn 1: not isError', turn1?.isError !== true, JSON.stringify(turn1));
+      const ctfSyncConvId = textOf(turn1).match(UUID_RE)?.[0];
+      ok('code_task_files sync conversation turn 1: started with a conversation id', !!ctfSyncConvId, textOf(turn1));
+
+      backend.reset();
+      const { result: turn2 } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'sync turn two', conversation_id: ctfSyncConvId }, 3);
+      ok('code_task_files sync conversation turn 2: not isError', turn2?.isError !== true, JSON.stringify(turn2));
+      const sent2 = backend.requests.at(-1)?.messages ?? [];
+      const roles2 = sent2.map((m) => m.role);
+      ok(
+        'code_task_files sync conversation turn 2: upstream messages are [system, history-user, history-assistant, file-bundle-user, bundle-ack, manifest-user]',
+        JSON.stringify(roles2) === JSON.stringify(['system', 'user', 'assistant', 'user', 'assistant', 'user']),
+        JSON.stringify(roles2),
+      );
+      const historyTurns = sent2.slice(1, -3); // strip system + this turn's [file-bundle, ack, manifest]
+      ok('code_task_files sync conversation turn 2: history has no code fence (the file bundle itself was never recorded)',
+        !historyTurns.some((m) => m.content.includes('```')), JSON.stringify(historyTurns));
+      ok('code_task_files sync conversation turn 2: history\'s stored turn one is the manifest line, not the file bundle',
+        /^\[files\]/.test(historyTurns[0]?.content ?? ''), JSON.stringify(historyTurns[0]));
+
+      const { result: listResult } = await callConversations(baseUrl, sessionId, { action: 'list' }, 4);
+      const listText = textOf(listResult);
+      ok('code_task_files sync conversation: appears in conversations list with 4 turns (2 per turn)', convHasTurns(listText, ctfSyncConvId, 4), listText);
+    }
+
+    // --- a file that fails to read is never named in the recorded manifest, only the readable one is ---
+    {
+      const { sessionId } = await initializeSession(baseUrl, '/mcp');
+      backend.reset();
+      const missingPath = '/nonexistent/path/does-not-exist-phase15-1b.ts';
+      const { result: turn1 } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile, missingPath], task: 'manifest turn one', start_conversation: true }, 5);
+      ok('code_task_files with one unreadable path: not isError (one readable file is enough)', turn1?.isError !== true, JSON.stringify(turn1));
+      const manifestConvId = textOf(turn1).match(UUID_RE)?.[0];
+      ok('manifest setup: conversation started', !!manifestConvId, textOf(turn1));
+
+      backend.reset();
+      const { result: turn2 } = await callCodeTaskFiles(baseUrl, sessionId, { paths: [thisFile], task: 'manifest turn two', conversation_id: manifestConvId }, 6);
+      ok('manifest turn two: not isError', turn2?.isError !== true, JSON.stringify(turn2));
+      const sent = backend.requests.at(-1)?.messages ?? [];
+      const historyManifest = sent[1]?.content ?? ''; // stored manifest+task from turn one
+      ok('manifest: does not name the unreadable file', !historyManifest.includes('does-not-exist-phase15-1b'), historyManifest);
+      ok('manifest: does name the readable file', historyManifest.includes('test-conversations-e2e.mjs'), historyManifest);
     }
 
     // === `conversations` management tool (phase 9, phase 4) ===
@@ -375,6 +446,10 @@ async function main() {
       !('start_conversation' in chatProps) && !('conversation_id' in chatProps), JSON.stringify(Object.keys(chatProps)));
     ok('off: custom_prompt.inputSchema.properties has no conversation params',
       !('start_conversation' in cpProps) && !('conversation_id' in cpProps), JSON.stringify(Object.keys(cpProps)));
+    // Phase 15-1b: code_task_files must lose the same two params, the same way.
+    const ctfProps = (list?.tools ?? []).find((t) => t.name === 'code_task_files')?.inputSchema?.properties ?? {};
+    ok('off: code_task_files.inputSchema.properties has no conversation params',
+      !('start_conversation' in ctfProps) && !('conversation_id' in ctfProps), JSON.stringify(Object.keys(ctfProps)));
     const toolNames = (list?.tools ?? []).map((t) => t.name);
     ok('off: tools/list does not include the conversations tool', !toolNames.includes('conversations'), JSON.stringify(toolNames));
 
@@ -389,6 +464,18 @@ async function main() {
     backend2.reset();
     const { result: cpOffResult } = await callCustomPrompt(baseUrl2, sessionId, { instruction: 'hi', max_tokens: 64, start_conversation: true }, 4);
     ok('off: custom_prompt with start_conversation:true is isError', cpOffResult?.isError === true, JSON.stringify(cpOffResult));
+
+    // Phase 15-1b: code_task_files must behave identically to custom_prompt
+    // here — both fold their conversation args through the same
+    // resolveConversation(), so there must be no tool-specific difference
+    // (e.g. one silently ignoring the params while the other errors).
+    backend2.reset();
+    const { result: ctfOffResult } = await callCodeTaskFiles(baseUrl2, sessionId, { paths: [thisFile], task: 'hi', start_conversation: true }, 7);
+    ok('off: code_task_files with start_conversation:true is isError, same as custom_prompt',
+      ctfOffResult?.isError === true && textOf(ctfOffResult) === textOf(cpOffResult),
+      JSON.stringify({ ctf: ctfOffResult, cp: cpOffResult }));
+    ok('off: code_task_files with start_conversation:true reaches the backend no more than custom_prompt does (rejected before inference, not silently ignored)',
+      backend2.requests.length === 0, String(backend2.requests.length));
 
     backend2.reset();
     const { result: cpNormalResult } = await callCustomPrompt(baseUrl2, sessionId, { instruction: 'hi', max_tokens: 64 }, 5);
