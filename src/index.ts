@@ -4738,12 +4738,37 @@ const HOUTINI_LM_HTTP_PORT = Math.max(1, parseInt(process.env.HOUTINI_LM_HTTP_PO
 const HOUTINI_LM_HTTP_HOST = process.env.HOUTINI_LM_HTTP_HOST || '0.0.0.0';
 const HOUTINI_LM_HTTP_PATH = process.env.HOUTINI_LM_HTTP_PATH || '/mcp';
 
+// HTTP session idle TTL: set HOUTINI_LM_HTTP_SESSION_TTL_MIN to a positive
+// number of minutes to enable automatic reaping of idle HTTP sessions at the
+// next request boundary. 0 (default) disables reaping entirely — no timer, no
+// sweep, zero overhead. Uses Number() instead of parseInt() to accept sub-minute
+// values (tests use 0.03 min ≈ 1800 ms); the outer if/else avoids the
+// `parseInt(...) || default` idiom because 0 is a meaningful value (disabled)
+// that must not be silently reinterpreted as the default by a typo.
+const HTTP_SESSION_TTL_MIN_RAW = (process.env.HOUTINI_LM_HTTP_SESSION_TTL_MIN || '').trim();
+const HTTP_SESSION_TTL_MS = (() => {
+  if (HTTP_SESSION_TTL_MIN_RAW === '') return 0;
+  const n = Number(HTTP_SESSION_TTL_MIN_RAW);
+  if (Number.isFinite(n) && n >= 0) return Math.round(n * 60_000);
+  process.stderr.write(
+    `[houtini-lm] Invalid HOUTINI_LM_HTTP_SESSION_TTL_MIN="${HTTP_SESSION_TTL_MIN_RAW}" (must be a non-negative number of minutes) — idle HTTP session reaping stays disabled\n`,
+  );
+  return 0;
+})();
+
 if (HOUTINI_LM_TRANSPORT !== 'stdio' && HOUTINI_LM_TRANSPORT !== 'http') {
   process.stderr.write(`[houtini-lm] Invalid HOUTINI_LM_TRANSPORT="${HOUTINI_LM_TRANSPORT}" — expected "stdio" or "http".\n`);
   process.exit(1);
 }
 
-type HoutiniSession = { server: Server; transport: StreamableHTTPServerTransport };
+type HoutiniSession = {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  /** ms epoch: 直近リクエストの開始/終了時刻。reapIdleSessions()のアイドル時計。 */
+  lastSeenAt: number;
+  /** このセッションが処理中のリクエスト数。>0の間は絶対に回収しない。 */
+  inFlight: number;
+};
 
 /**
  * Streamable HTTP entry point. Each new session (a POST with no
@@ -4767,6 +4792,38 @@ async function startHttpTransport(): Promise<void> {
     });
   });
 
+  /**
+   * Lazy sweep of idle HTTP sessions at the next request boundary. Does NOT use
+   * a background timer (setInterval) — same design choice as
+   * ConversationStore.sweep() (src/conversation-store.ts, 28-36): no constant
+   * timer running for the lifetime of the server, reaping only happens as a side
+   * effect of actual request traffic.
+   *
+   * inFlight guard (session.inFlight === 0): Protocol._onclose() inside
+   * @modelcontextprotocol/sdk aborts in-flight request handlers when transport
+   * is closed, so reaping a busy session would cancel an active inference call.
+   *
+   * Job guard (JOBS_ENABLED && CONVERSATION_OWNER_HEADER === '' && jobs.countActive(sid) > 0):
+   * when the owner header is unset, transport.onclose calls jobs.clear(sessionId),
+   * which would destroy the result of a running async job. The session is kept
+   * alive until the job completes.
+   */
+  function reapIdleSessions(now: number): void {
+    if (HTTP_SESSION_TTL_MS <= 0) return;
+    let reaped = 0;
+    for (const [sid, session] of sessions) {
+      if (now - session.lastSeenAt <= HTTP_SESSION_TTL_MS) continue;
+      if (session.inFlight > 0) continue;
+      if (JOBS_ENABLED && CONVERSATION_OWNER_HEADER === '' && jobs.countActive(sid) > 0) continue;
+      sessions.delete(sid);
+      void session.transport.close().catch(() => {});
+      reaped++;
+    }
+    if (reaped > 0) {
+      process.stderr.write(`[houtini-lm] Reaped ${reaped} idle HTTP session(s) (idle > ${HTTP_SESSION_TTL_MIN_RAW} min)\n`);
+    }
+  }
+
   async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://localhost');
 
@@ -4782,6 +4839,8 @@ async function startHttpTransport(): Promise<void> {
       return;
     }
 
+    reapIdleSessions(Date.now());
+
     const sessionIdHeader = req.headers['mcp-session-id'];
     const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
 
@@ -4792,7 +4851,14 @@ async function startHttpTransport(): Promise<void> {
         res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null }));
         return;
       }
-      await existing.transport.handleRequest(req, res);
+      existing.lastSeenAt = Date.now();
+      existing.inFlight += 1;
+      try {
+        await existing.transport.handleRequest(req, res);
+      } finally {
+        existing.inFlight -= 1;
+        existing.lastSeenAt = Date.now();
+      }
       return;
     }
 
@@ -4814,7 +4880,7 @@ async function startHttpTransport(): Promise<void> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
-        sessions.set(sid, { server: newServer, transport });
+        sessions.set(sid, { server: newServer, transport, lastSeenAt: Date.now(), inFlight: 1 });
       },
     });
     transport.onclose = () => {
@@ -4847,7 +4913,15 @@ async function startHttpTransport(): Promise<void> {
     // Do not pre-read `req` — handing it to handleRequest as a live stream
     // lets the transport parse the body itself. Reading it first would
     // consume the stream and hang the transport's own read.
-    await transport.handleRequest(req, res);
+    try {
+      await transport.handleRequest(req, res);
+    } finally {
+      const entry = sessions.get(transport.sessionId ?? '');
+      if (entry) {
+        entry.inFlight -= 1;
+        entry.lastSeenAt = Date.now();
+      }
+    }
   }
 
   await new Promise<void>((resolve) => {
